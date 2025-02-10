@@ -20,7 +20,7 @@ def create_default_directory():
     default_dir.mkdir(parents=True, exist_ok=True)
     return default_dir
 
-def install(device_type, token):
+def install(device_type, token, host):
     if device_type == "cloud":
         response = requests.get("https://api.ipify.org?format=text")
         wan_host = response.text
@@ -66,7 +66,7 @@ def install(device_type, token):
     else:
         print("Wrong Device Type Selected!")
 
-    endpoint2 = f"https://alfa.suite.novavision.ai/api/device/data/register-device?access-token={token}"
+    endpoint2 = f"{host}api/device/data/register-device?access-token={token}"
     print("Sending data to Endpoint2...")
     endpoint2_response = post_to_endpoint(endpoint=endpoint2, data=data)
     if endpoint2_response["status_code"] == 200:
@@ -75,7 +75,7 @@ def install(device_type, token):
         response_uuid = response.get("uuid")
         access_token = response.get("access-token")
 
-        endpoint3 = f"https://alfa.suite.novavision.ai/api/device/data/initialize-device?access-token={access_token}"
+        endpoint3 = f"{host}api/device/data/initialize-device?access-token={access_token}"
 
         print("Sending device info to Endpoint3...")
         device_info = get_system_info()
@@ -84,11 +84,11 @@ def install(device_type, token):
         if endpoint3_response["status_code"] == 200:
             print(f"Response from Endpoint3: {endpoint3_response['json']}")
 
-            server_endpoint = f"https://alfa.suite.novavision.ai/api/device/data/get-server?access-token={access_token}"
+            server_endpoint = f"{host}api/device/data/get-server?access-token={access_token}"
             server_response = requests.get(server_endpoint)
             file_id = server_response.json()
 
-            file_endpoint = f"https://alfa.suite.novavision.ai/api/storage/default/get-file?access-token={access_token}&id={file_id}"
+            file_endpoint = f"{host}api/storage/default/get-file?access-token={access_token}&id={file_id}"
             file_response = requests.get(file_endpoint)
 
             extract_path = create_default_directory()
@@ -117,22 +117,26 @@ def install(device_type, token):
                 if zip_path.exists():
                     os.remove(zip_path)
 
+def deploy(type, id, to):
+    pass
 
 def docker_run():
     extract_path = Path.home() / ".novavision"
-    folder = [item for item in extract_path.iterdir() if item.is_dir()]
+    server_path = extract_path / "Server"
+    folder = [item for item in server_path.iterdir() if item.is_dir()]
     docker_compose_file = folder[0] / "docker-compose.yml"
     try:
-        subprocess.run(["docker", "compose", "-f", docker_compose_file, "up", "-d"], check=True)
+        subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error while starting Docker container: {e}")
 
 def docker_stop():
     extract_path = Path.home() / ".novavision"
-    folder = [item for item in extract_path.iterdir() if item.is_dir()]
+    server_path = extract_path / "Server"
+    folder = [item for item in server_path.iterdir() if item.is_dir()]
     docker_compose_file = folder[0] / "docker-compose.yml"
     try:
-        subprocess.run(["docker", "compose", "-f", docker_compose_file, "down"], check=True)
+        subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down"], check=True)
     except subprocess.CalledProcessError as e:
         print(f"Error while stopping Docker container: {e}")
 
@@ -144,11 +148,17 @@ def main():
     install_parser = subparsers.add_parser("install", help="Initialize and Download Agent")
     install_parser.add_argument("device_type", choices=["edge", "local", "cloud"],
                                help="Select and Configure Device Type")
-    install_parser.add_argument("token", help="Authentication Token")
+    install_parser.add_argument("token", help="User Authentication Token")
+    install_parser.add_argument("--host", default="https://alfa.suite.novavision.ai/", help="Host Url")
 
     start_parser = subparsers.add_parser("start", help="Start Docker Container")
     start_parser.add_argument("type", choices=["server", "app"])
     start_parser.add_argument("--id", help="AppID for App Choice", required=False)
+
+    deploy_parser = subparsers.add_parser("deploy", help="Deploying App")
+    deploy_parser.add_argument("type", choices="app")
+    deploy_parser.add_argument("--id", help="AppID for Which App Will Be Deployed", required=False)
+    deploy_parser.add_argument("token", help="User Authentication Token")
 
     stop_parser = subparsers.add_parser("stop", help="Stop Docker Container")
     stop_parser.add_argument("type", choices=["server", "app"])
@@ -158,15 +168,18 @@ def main():
     args = parser.parse_args()
 
     if args.command == "install":
-        install(args.device_type, args.token)
-    if args.command == "start":
-        if (args.type == "app" and args.app_id) or args.type == "server":
+        install(args.device_type, args.token, args.host)
+    elif args.command == "start":
+        if (args.type == "app" and args.id) or args.type == "server":
             docker_run()
         else:
             print("Invalid Arguments")
+    elif args.command == "deploy":
+        if args.type and args.id:
+            deploy(args.type, args.id, args.token)
 
-    if args.command == "stop":
-        if (args.type == "app" and args.app_id) or args.type == "server":
+    elif args.command == "stop":
+        if (args.type == "app" and args.id) or args.type == "server":
             docker_stop()
         else:
             print("Invalid Arguments")

@@ -9,14 +9,15 @@ setup(
                       "psutil",
                       "docker"],
     entry_points={
-        'console_scripts': ['novavision-cli=novavision.cli:main'],
+        'console_scripts': ['novavision=novavision.cli:main'],
     },
     author="Kaan",
     author_email="kaanyzc2002@gmail.com",
     description="CLI example",
+    license="Apache-2.0",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
+        "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent"
     ],
     python_requires='>=3.8',
