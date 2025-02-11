@@ -20,6 +20,39 @@ def create_default_directory():
     default_dir.mkdir(parents=True, exist_ok=True)
     return default_dir
 
+
+def get_running_containers():
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}} {{.Ports}}"],
+            capture_output=True, text=True, check=True
+        )
+
+        containers = result.stdout.strip().split("\n")
+        if not containers or containers == [""]:
+            print("No running containers found.")
+            return
+
+        print("\nRunning Containers and Ports:")
+        for container in containers:
+            parts = container.split(" ", 1)
+            name = parts[0]
+
+            if len(parts) > 1:
+                ports = parts[1]
+                for port_mapping in ports.split(", "):
+                    if "->" in port_mapping:
+                        port = port_mapping.split("->")[0].strip()
+                        port = port.split(":")[-1]
+
+            else:
+                port = "No ports"
+
+            print(f"{name} -> Port: {port}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error retrieving running containers: {e}")
+
 def install(device_type, token, host):
     if device_type == "cloud":
         response = requests.get("https://api.ipify.org?format=text")
@@ -105,9 +138,21 @@ def install(device_type, token, host):
 
                 print(f"Files extracted successfully to: {extract_path}")
 
-                env_file = extract_path / ".env"
-                with open(env_file, "a") as f:
-                    f.write(f"ROOT_PATH={extract_path}")
+                server_path = extract_path / "Server"
+                env_file = server_path / ".env"
+                key, value = "ROOT_PATH", str(server_path)
+
+                if env_file.exists():
+                    with open(env_file, "r") as f:
+                        lines = f.readlines()
+                    lines = [f"{key}={value}\n" if line.startswith(f"{key}=") else line for line in lines]
+                    if not any(line.startswith(f"{key}=") for line in lines):
+                        lines.append(f"{key}={value}\n")
+                else:
+                    lines = [f"{key}={value}\n"]
+
+                with open(env_file, "w") as f:
+                    f.writelines(lines)
 
             except zipfile.BadZipFile:
                 print("Error: The downloaded file is not a valid zip file")
@@ -118,19 +163,26 @@ def install(device_type, token, host):
                     os.remove(zip_path)
 
 def deploy(type, id, to):
+    # App deployu ve agent'ın içerisine konulması
     pass
 
-def docker_run():
+def docker_run(type):
     extract_path = Path.home() / ".novavision"
     server_path = extract_path / "Server"
-    folder = [item for item in server_path.iterdir() if item.is_dir()]
-    docker_compose_file = folder[0] / "docker-compose.yml"
+    server_folder = [item for item in server_path.iterdir() if item.is_dir()]
+    if type == "server":
+        docker_compose_file = server_folder[0] / "docker-compose.yml"
+    else:
+        app_folder = [item for item in server_folder[0].iterdir() if item.is_dir()]
+        docker_compose_file = app_folder[0] / "docker-compose.yml"
     try:
         subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+        get_running_containers()
     except subprocess.CalledProcessError as e:
         print(f"Error while starting Docker container: {e}")
 
-def docker_stop():
+
+def docker_stop(type):
     extract_path = Path.home() / ".novavision"
     server_path = extract_path / "Server"
     folder = [item for item in server_path.iterdir() if item.is_dir()]
@@ -171,18 +223,19 @@ def main():
         install(args.device_type, args.token, args.host)
     elif args.command == "start":
         if (args.type == "app" and args.id) or args.type == "server":
-            docker_run()
+            docker_run(args.type)
         else:
             print("Invalid Arguments")
     elif args.command == "deploy":
         if args.type and args.id:
             deploy(args.type, args.id, args.token)
-
     elif args.command == "stop":
         if (args.type == "app" and args.id) or args.type == "server":
-            docker_stop()
+            docker_stop(args.type)
         else:
             print("Invalid Arguments")
+    else:
+        print("Invalid Command")
 
 if __name__ == "__main__":
     main()
