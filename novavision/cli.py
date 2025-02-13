@@ -1,9 +1,5 @@
 import os
-import sys
-import json
-import stat
 import uuid
-import shutil
 import zipfile
 import argparse
 import requests

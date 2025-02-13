@@ -16,7 +16,7 @@ class ConsoleLogger:
     }
 
     ICONS = {
-        'info': 'ℹ️ ',
+        'info': 'ℹ️',
         'success': '✅',
         'warning': '⚠️',
         'error': '❌',
