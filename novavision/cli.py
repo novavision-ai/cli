@@ -1,9 +1,14 @@
 import os
+import stat
 import uuid
+import yaml
+import shutil
 import zipfile
 import argparse
 import requests
+import platform
 import subprocess
+
 from pathlib import Path
 from novavision.utils import get_system_info
 from novavision.logger import ConsoleLogger
@@ -37,12 +42,99 @@ def create_default_directory():
     default_dir.mkdir(parents=True, exist_ok=True)
     return default_dir
 
-def change_owner_and_remove(path):
+def remove_readonly(func, path, exc_info):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+def remove_directory(path):
     try:
-        subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", path], check=True)
-        subprocess.run(["rm", "-rf", path], check=True)
-    except subprocess.CalledProcessError as e:
-        log.error(f"Failed to change owner or remove path: {e}")
+        if platform.system() == "Windows":
+            shutil.rmtree(path, onerror=remove_readonly)
+        else:
+            subprocess.run(
+                ["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", path],
+                check=True
+            )
+            subprocess.run(["rm", "-rf", path], check=True)
+    except Exception as e:
+        print(f"Failed to remove {path}: {e}")
+
+def get_docker_build_info(compose_file):
+    try:
+        with open(compose_file, "r") as file:
+            compose_data = yaml.safe_load(file)
+
+        services = compose_data.get("services", {})
+        build_info = {}
+
+        for service, config in services.items():
+            image_name = config.get("image")
+            build_context = config.get("build", {}).get("context")
+
+            if image_name and build_context:
+                build_info[service] = {"image": image_name, "context": build_context}
+
+        if not build_info:
+            log.error("No buildable services found in docker-compose.yml!")
+            return None
+
+        log.info(f"Found services in compose file: {build_info}")
+        return build_info
+
+    except Exception as e:
+        log.error(f"Failed to read docker-compose.yml: {e}")
+        return None
+
+def choose_server_folder(server_path):
+    server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+
+    if not server_folders:
+        log.error("No server folders found!")
+        return None
+
+    if len(server_folders) == 1:
+        return server_folders[0]
+
+    log.info("Multiple server folders found. Please select one:")
+
+    for idx, folder in enumerate(server_folders):
+        log.info(f"{idx + 1}. {folder.name}")
+
+    while True:
+        try:
+            choice = int(log.question("Enter the number of the server you want to start: "))
+            if 1 <= choice <= len(server_folders):
+                return server_folders[choice - 1]
+            else:
+                log.warning("Invalid selection. Please enter a valid number.")
+        except ValueError:
+            log.warning("Invalid input. Please enter a number.")
+
+def get_running_container_compose_file():
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
+        )
+        running_containers = result.stdout.strip().split("\n")
+
+        if not running_containers:
+            log.warning("No running containers found.")
+            return None
+
+        extract_path = Path.home() / ".novavision" / "Server"
+        for folder in extract_path.iterdir():
+            if folder.is_dir():
+                compose_file = folder / "docker-compose.yml"
+                if compose_file.exists():
+                    for container_name in running_containers:
+                        if container_name.startswith(folder.name):
+                            log.info(f"Found running container: {container_name} using {compose_file}")
+                            return compose_file
+        log.warning("No matching running container found in known server folders.")
+        return None
+    except Exception as e:
+        log.error(f"Error while fetching running container: {e}")
+        return None
 
 def install(device_type, token, host):
     if device_type == "cloud":
@@ -50,21 +142,21 @@ def install(device_type, token, host):
         wan_host = response.text
 
         log.info(f"Detected WAN HOST: {wan_host}")
-        user_wan_ip = log.question("Would you like to use detected WAN HOST? (y/n): ").strip().lower()
+        user_wan_ip = log.question("Would you like to use detected WAN HOST? (y/n)").strip().lower()
 
         if user_wan_ip == "y":
             log.info("Using detected WAN HOST...")
         elif user_wan_ip == "n":
-            wan_host = log.question("Enter WAN HOST: ").strip()
+            wan_host = log.question("Enter WAN HOST").strip()
         else:
             print("Invalid input. Using detected WAN HOST...")
 
-        user_port = log.question("Default port is 7001. Would you like to use it? (y/n):  ").strip().lower()
+        user_port = log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
 
         if user_port == "y":
             port = "7001"
         elif user_port == "n":
-            port = log.question("Please enter desired port: ")
+            port = log.question("Please enter desired port")
         else:
             log.error("Invalid input.")
 
@@ -75,18 +167,17 @@ def install(device_type, token, host):
         "os_api_port": f"{port}",
         "os_api_ssl": "DISABLE",
         "wan_host": f"{wan_host}",
-        "type": "cloud"
+        "type": "Cloud"
     }
 
     elif device_type == "local":
         server_path = Path.home() / ".novavision" / "Server"
         if os.path.exists(server_path):
             delete = log.question(
-                "There is already a server installed on this machine. Previous installation will be removed. All unsaved changes will be deleted. Would you like to continue?(y/n): ").strip().lower()
+                "There is already a server installed on this machine. Previous installation will be removed. All unsaved changes will be deleted. Would you like to continue?(y/n)").strip().lower()
             if delete == "y":
                 try:
-                    with log.loading("Deleting existing server. User Password Will Be Asked!"):
-                        change_owner_and_remove(server_path)
+                    remove_directory(server_path)
                 except Exception as e:
                     log.error(f"Deletion failed: {e}")
                 device_endpoint = f"{host}/api/device/default?filter[device_type][eq]=3"
@@ -97,7 +188,7 @@ def install(device_type, token, host):
                     response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
 
                 if response.status_code == 204:
-                    log.success("Successfully removed device.")
+                    log.success("Successfully removed device and server.")
                 else:
                     log.error("Failed to removed device.")
                     return
@@ -110,7 +201,7 @@ def install(device_type, token, host):
         "os_api_host": "0.0.0.0",
         "os_api_port": "7001",
         "os_api_ssl": "DISABLE",
-        "type": "local"
+        "type": "Local"
         }
 
     else:
@@ -178,16 +269,30 @@ def install(device_type, token, host):
 
                 try:
                     deploy_endpoint = f"{host}/api/device/deploy/{id_deploy}"
-                    image_exist = subprocess.run(["docker", "images", "-q", "diginova-wsl"], capture_output=True,
-                                                 text=True)
+                    image_exist = subprocess.run(["docker", "images", "-q", "diginova-wsl"], capture_output=True, text=True)
                     if not image_exist.stdout.strip():
                         server_path = Path.home() / ".novavision" / "Server"
                         server_folder = [item for item in server_path.iterdir() if item.is_dir()]
-                        docker_file = server_folder[0] / "diginova-wsl" / "Dockerfile.prod"
-                        subprocess.run(
-                            ["docker", "build", "-t", "diginova-wsl", "-f", str(docker_file), str(docker_file.parent)])
-                    log.success("Server built successfully!")
+                        agent_folder = max(server_folder, key=lambda folder: folder.stat().st_mtime)
+                        compose_file = agent_folder / "docker-compose.yml"
+                        if not compose_file.exists():
+                            log.error(f"No docker-compose.yml found in {agent_folder}!")
+                        build_info = get_docker_build_info(compose_file)
+                        for service, info in build_info.items():
+                            image_name = info["image"]
+                            build_context = agent_folder / Path(info["context"])
+                            dockerfile = build_context / "Dockerfile.prod"
+                            if dockerfile.exists():
+                                log.info(f"Building Docker image {image_name} from {dockerfile}...")
+                                subprocess.run(
+                                    ["docker", "build", "-t", image_name, "-f", str(dockerfile), str(build_context)],
+                                    check=True
+                                )
+                                log.success(f"Docker image {image_name} built successfully!")
+                            else:
+                                log.error(f"Dockerfile.prod not found in {build_context} for service {service}!")
 
+                    log.success("Server built successfully!")
                     deploy_data = {"is_deploy": 1}
                     try:
                         with log.loading("Sending deployment status"):
@@ -235,10 +340,18 @@ def deploy(type, id, to):
 def manage_docker(command, type):
     extract_path = Path.home() / ".novavision"
     server_path = extract_path / "Server"
-    server_folder = [item for item in server_path.iterdir() if item.is_dir()]
 
     if type == "server":
-        docker_compose_file = server_folder[0] / "docker-compose.yml"
+        if command == "start":
+            selected_server_folder = choose_server_folder(server_path)
+            if not selected_server_folder:
+                return
+            docker_compose_file = selected_server_folder / "docker-compose.yml"
+        else:
+            docker_compose_file = get_running_container_compose_file()
+            if not docker_compose_file:
+                log.error("No running server found to stop.")
+                return
     else:
         # App'in compose'u seçilmeli.
         pass
@@ -250,6 +363,7 @@ def manage_docker(command, type):
                 capture_output=True, text=True
             ).stdout.strip().split("\n"))
 
+            log.info("Starting server")
             subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
             result = subprocess.run(
                 ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],

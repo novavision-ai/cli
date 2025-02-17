@@ -2,12 +2,14 @@ from setuptools import setup, find_packages
 
 setup(
     name='novavision-cli',
-    version='0.1.6',
+    version='0.1.10',
     packages=find_packages(),
     install_requires=["requests",
                       "GPUtil",
                       "psutil",
-                      "docker>=6.1.3,<7"],
+                      "docker>=6.1.3,<7",
+                      "rich",
+                      "pyyaml"],
     entry_points={
         'console_scripts': ['novavision=novavision.cli:main'],
     },
