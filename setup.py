@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='novavision-cli',
-    version='0.1.10',
+    version='0.1.11',
     packages=find_packages(),
     install_requires=["requests",
                       "GPUtil",

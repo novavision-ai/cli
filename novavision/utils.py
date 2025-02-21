@@ -1,14 +1,12 @@
 import os
 import psutil
 import GPUtil
+import hashlib
 import platform
 import subprocess
 
 
 def get_cpu_info():
-    """
-    Returns detailed CPU model name across different operating systems
-    """
     if platform.system() == "Windows":
         try:
             import winreg
@@ -38,13 +36,9 @@ def get_cpu_info():
     return platform.processor() or "Unknown CPU"
 
 def get_os_info():
-    """
-    Returns detailed OS information including distribution version for Linux
-    """
     system = platform.system()
     if system == "Linux":
         try:
-            # Linux dağıtımı ve sürüm bilgisini al
             distro_info = {}
             if os.path.exists('/etc/os-release'):
                 with open('/etc/os-release') as f:
@@ -54,7 +48,7 @@ def get_os_info():
                             distro_info[key] = value.strip('"')
 
             if 'VERSION_ID' in distro_info:
-                return f"Ubuntu {distro_info['VERSION_ID']}"  # veya distro_info['PRETTY_NAME']
+                return f"Ubuntu {distro_info['VERSION_ID']}"
             else:
                 return f"{platform.system()} {platform.release()}"
         except:
@@ -66,37 +60,47 @@ def get_os_info():
     else:
         return f"{system} {platform.release()}"
 
+def get_mac_address():
+
+    for interface, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if addr.family == psutil.AF_LINK:
+                return addr.address.upper().replace(":", "").replace("-", "")
+    return None
+
+def generate_serial():
+    mac = get_mac_address()
+    if not mac:
+        return "UNKNOWN"
+
+    mac_bytes = mac.encode()
+    hash_value = hashlib.sha256(mac_bytes).hexdigest()
+    serial = hash_value[:8].upper()
+    return serial
+
 def get_system_info():
-    """
-    Returns system information including CPU, GPU, OS, disk, memory and architecture
-    in a platform-independent way.
-    """
     try:
-        # CPU bilgisi
         cpu = get_cpu_info()
 
-        # GPU bilgisi
         try:
             gpus = GPUtil.getGPUs()
             gpu = gpus[0].name if gpus else "GPU not found"
         except:
             gpu = "GPU information unavailable"
 
-        # OS bilgisi
         os_info = get_os_info()
 
-        # Disk bilgisi
         disk = psutil.disk_usage('/')
         total_disk = f"{disk.total / (1024 ** 3):.2f}G"
         used_disk = f"{disk.used / (1024 ** 3):.2f}G"
         disk_info = f"{total_disk}/{used_disk}"
 
-        # RAM bilgisi
         memory = psutil.virtual_memory()
         memory_info = f"{memory.total / (1024 ** 3):.2f} GB"
 
-        # Mimari bilgisi
         architecture = platform.machine()
+
+        serial = generate_serial()
 
         return {
             "cpu": cpu,
@@ -104,7 +108,8 @@ def get_system_info():
             "os": os_info,
             "disk": disk_info,
             "memory": memory_info,
-            "architecture": architecture
+            "architecture": architecture,
+            "serial": serial
         }
     except Exception as e:
         return {
