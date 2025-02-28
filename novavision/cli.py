@@ -1,6 +1,5 @@
 import os
 import stat
-import uuid
 import yaml
 import shutil
 import zipfile
@@ -41,10 +40,23 @@ def request_to_endpoint(method, endpoint, data=None, auth_token=None):
         log.error(f"HTTP request failed: {e}")
         return response
 
-def create_default_directory():
-    default_dir = Path.home() / ".novavision"
-    default_dir.mkdir(parents=True, exist_ok=True)
-    return default_dir
+def format_host(host):
+    host = host.strip()
+
+    if not host.startswith("https://"):
+        if host.startswith("http://"):
+            host = host[len("http://"):]
+        host = "https://" + host
+
+    if not host.endswith("/"):
+        host = host + "/"
+
+    return host
+
+def create_agent():
+    agent_dir = Path.home() / ".novavision"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    return agent_dir
 
 def remove_readonly(func, path, exc_info):
     os.chmod(path, stat.S_IWRITE)
@@ -82,7 +94,6 @@ def get_docker_build_info(compose_file):
             log.error("No buildable services found in docker-compose.yml!")
             return None
 
-        log.info(f"Found services in compose file: {build_info}")
         return build_info
 
     except Exception as e:
@@ -106,7 +117,7 @@ def choose_server_folder(server_path):
 
     while True:
         try:
-            choice = int(log.question("Enter the number of the server you want to start: "))
+            choice = int(log.question("Enter the number of the server you want to start"))
             if 1 <= choice <= len(server_folders):
                 return server_folders[choice - 1]
             else:
@@ -140,107 +151,170 @@ def get_running_container_compose_file():
         log.error(f"Error while fetching running container: {e}")
         return None
 
-def register_device_with_retry(data, token, host, device_info, device_type):
-    register_endpoint = f"{host}/api/device/data/register-device"
-
-    if device_type == "local":
-        type = DEVICE_TYPE_LOCAL
-    elif device_type == "cloud":
-        type = DEVICE_TYPE_CLOUD
-    else:
-        type = DEVICE_TYPE_EDGE
+def register_device_with_retry(data, token, host, device_info):
+    register_endpoint = f"{host}api/device/default?expand=user"
 
     while True:
         with log.loading("Registering device"):
-            register_response = request_to_endpoint(method="post", endpoint=register_endpoint, data=data, auth_token=token).json()
+            register_response = request_to_endpoint(method="post", endpoint=register_endpoint, data=data, auth_token=token)
 
-        device_endpoint = f"{host}/api/device/default?filter[device_type][eq]={type}"
-        device_response = request_to_endpoint(method="get", endpoint=device_endpoint, auth_token=token).json()
+        try:
+            register_json = register_response.json()
+        except ValueError:
+            log.error(f"Invalid response format received from server: {register_response.text}")
+            return None
 
-        devices = [
-            {"id_device": device["id_device"], "name": device["name"], "serial": device["serial"]}
-            for device in device_response if device["device_type"] == type
-        ]
+        device_endpoint = f"{host}api/device/default"
+        device_response = request_to_endpoint(method="get", endpoint=device_endpoint, auth_token=token)
 
-        if register_response.get("status") == "success":
+        if not device_response:
+            log.error("Failed to fetch device list.")
+            return None
+
+        try:
+            device_response = device_response.json()
+        except ValueError:
+            log.error(f"Invalid response format received while fetching devices: {device_response.text}")
+            return None
+
+        if register_response.status_code in [200, 201]:
             log.success("Device registered successfully!")
-            return register_response
+            return register_json
 
-        elif register_response.get("status") == 403 or register_response.get("status") == 400:
-            if register_response.get("code") == 1:
-                log.warning("User exceeds the maximum limit of five devices! Device removing must needed to continue.")
+        elif register_response.status_code in [400, 403]:
+            error_code = register_json.get("code", None)
 
-                if not devices:
-                    log.error("There is no device to remove.")
+            if error_code == 1:
+                log.warning("User exceeds the maximum limit of five devices! Device removal is needed.")
+
+                if not device_response:
+                    log.error("No devices found for removal.")
                     return None
 
                 log.info("Current devices:")
-                for idx, device in enumerate(devices):
-                    log.info(f"{idx + 1}. {device['name']} (ID: {device['id_device']})")
+                for idx, device in enumerate(device_response):
+                    device_type = {1: "cloud", 2: "edge"}.get(device["device_type"], "local")
+                    log.info(f"{idx + 1}. {device['name']} (Device type: {device_type})")
 
                 while True:
                     try:
-                        choice = int(log.question("Please select a device to remove: "))
-                        if 1 <= choice <= len(devices):
-                            device_id_to_delete = devices[choice - 1]['id_device']
+                        choice = int(log.question("Please select a device to remove"))
+                        if 1 <= choice <= len(device_response):
+                            device_id_to_delete = device_response[choice - 1]['id_device']
                             break
                         else:
                             log.warning("Invalid selection. Please select a number from the list.")
                     except ValueError:
                         log.warning("Invalid entry. Please enter a number.")
 
-                delete_endpoint = f"{host}/api/device/default/{device_id_to_delete}"
+                delete_endpoint = f"{host}api/device/default/{device_id_to_delete}"
 
                 with log.loading("Removing device"):
                     delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
 
-                if delete_response.status_code == 204:
-                    log.success(f"Device '{device_id_to_delete}' removed successfuly.")
-                    log.info("Trying registration.")
+                if delete_response and delete_response.status_code == 204:
+                    log.success(f"Device '{device_response[choice - 1]['name']}' removed successfully.")
+                    log.info("Trying registration again.")
                     continue
                 else:
                     log.error("Device removal failed!")
                     return None
+
             else:
-                if register_response.get("message") == "Device already exists":
-                    log.warning("There is a device already registered for this machine. In order to continue, device must be removed.")
-                    remove = log.question("Device removal will be performed. Would you like to proceed?(y/n)")
-                    if remove == "y":
+                error_data = register_json.get("error", {})
+                serial_errors = error_data.get("serial", [])
+
+                if isinstance(serial_errors, list) and "This serial has already been taken." in serial_errors:
+                    log.warning("A device with this serial is already registered. It must be removed to continue.")
+                    remove = log.question("Would you like to remove the device? (y/n)")
+
+                    if remove.lower() == "y":
                         target_serial = device_info['serial']
-                        matching_devices = [device for device in device_response if device.get("serial") == target_serial]
+                        matching_devices = [d for d in device_response if d.get("serial") == target_serial]
+
                         if matching_devices:
-                            delete_endpoint = f"{host}/api/device/default/{matching_devices[0]['id_device']}"
+                            delete_endpoint = f"{host}api/device/default/{matching_devices[0]['id_device']}"
 
                             with log.loading("Removing device"):
-                                delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
+                                delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint,
+                                                                      auth_token=token)
 
-                            if delete_response.status_code == 204:
-                                log.success(f"Device removed successfully.")
+                            if delete_response and delete_response.status_code == 204:
+                                log.success("Device removed successfully.")
+                                continue
                             else:
                                 log.error("Device removal failed!")
                                 return None
                         else:
-                            log.error("There is no device to remove.")
-                            return
+                            log.error("No matching device found for removal.")
+                            return None
                     else:
                         log.warning("Aborting.")
-                        return
+                        return None
 
-                else:
-                    log.error(f"Device removal failed!  {register_response.get('message')}")
-                    return None
+                error_message = register_json.get("message", "Unknown error occurred.")
+                log.error(f"Device registration failed: {error_message}")
+                return None
+
         else:
-            log.error(f"Unexpected occurrence. Status code: {register_response.status_code}")
+            log.error(f"Unexpected error occurred. Status code: {register_response.status_code}")
             return None
 
-    log.error("Maximum retries exceeded. Please try again later.")
-    return None
 
+def install(device_type, token, host, workspace):
+    formatted_host = format_host(host)
 
-def install(device_type, token, host):
     device_info = get_system_info()
+
+    workspace_endpoint = f"{formatted_host}api/workspace/user?expand=workspace"
+    workspace_list_response = request_to_endpoint(method="get", endpoint=workspace_endpoint, auth_token=token)
+    if workspace_list_response.status_code != 200:
+        log.error("Workspace list request failed.")
+        return
+
+    workspace_list = workspace_list_response.json()
+
+    if not workspace:
+        if workspace_list is None:
+            log.error("There is no workspace available.")
+            return None
+
+        if len(workspace_list) == 1:
+            log.info("There is only one workspace available. Continuing registration.")
+
+        else:
+            log.info("There are multiple workspaces available for user. Current workspaces available:")
+            for idx, workspaces in enumerate(workspace_list):
+                log.info(f"{idx + 1}. {workspaces['workspace']['name']} (Workspace ID: {workspaces['id_workspace_user']})")
+
+            while True:
+                try:
+                    choice = int(log.question("Please select a workspace to continue"))
+                    if 1 <= choice <= len(workspace_list):
+                        workspace_id_to_select = workspace_list[choice - 1]['id_workspace_user']
+                        break
+                    else:
+                        log.warning("Invalid selection. Please select a number from the list.")
+                except ValueError:
+                    log.warning("Invalid entry. Please enter a number.")
+    else:
+        workspace_to_select = [workspaces for workspaces in workspace_list if workspaces["workspace"]["name"] == workspace]
+        workspace_id_to_select = workspace_to_select[0]["id_workspace_user"]
+
+
+    set_workspace_endpoint = f"{formatted_host}api/workspace/user/{workspace_id_to_select}"
+    workspace_data = {"status": 1}
+    set_workspace_response = request_to_endpoint(method="put", endpoint=set_workspace_endpoint, data=workspace_data, auth_token=token)
+    if set_workspace_response.status_code == 200:
+        log.success("Workspace set successfully!")
+    else:
+        log.error("Workspace set failed!")
+        return set_workspace_response.status_code
+
+
+
     if device_type == "cloud":
-        response = request_to_endpoint("get", "https://api.ipify.org?format=text")
+        response = request_to_endpoint(method="get", endpoint="https://api.ipify.org?format=text")
         wan_host = response.text
 
         log.info(f"Detected WAN HOST: {wan_host}")
@@ -264,14 +338,12 @@ def install(device_type, token, host):
 
 
         data = {
-            "name": f"{uuid.uuid4()}",
-            "os_api_host": "0.0.0.0",
+            "name": f"{device_info['device_name']}",
+            "serial": f"{device_info['serial']}",
+            "device_type": DEVICE_TYPE_CLOUD,
             "os_api_port": f"{port}",
-            "os_api_ssl": "DISABLE",
             "wan_host": f"{wan_host}",
-            "type": f"{DEVICE_TYPE_CLOUD}",
-            "serial": f"{device_info['serial']}"
-    }
+        }
 
     elif device_type == "local":
         server_path = Path.home() / ".novavision" / "Server"
@@ -288,52 +360,70 @@ def install(device_type, token, host):
                 return
 
         data = {
-            "name": f"{uuid.uuid4()}",
-            "os_api_host": "0.0.0.0",
-            "os_api_ssl": "DISABLE",
-            "type": f"{DEVICE_TYPE_LOCAL}",
-            "serial": f"{device_info['serial']}"
+            "name": f"{device_info['device_name']}",
+            "device_type": DEVICE_TYPE_LOCAL,
+            "serial": f"{device_info['serial']}",
         }
 
     else:
         log.error("Wrong device type selected!")
         return
 
-    response_json = register_device_with_retry(data=data, token=token, host=host, device_info=device_info, device_type=device_type)
+    register_response = register_device_with_retry(data=data, token=token, host=formatted_host, device_info=device_info)
 
-    if response_json is None:
+    if register_response is None:
         return
 
-    access_token = response_json.get("access-token")
-    id_deploy = response_json.get("id_deploy")
+    try:
+        access_token = register_response["user"]["access_token"]
+        id_device = register_response["id_device"]
+    except Exception as e:
+        log.error(f"Error while getting access token and device id: {e}")
+        return
 
-    initialize_endpoint = f"{host}/api/device/data/initialize-device"
+    device_update_endpoint = f"{formatted_host}api/device/default/{id_device}"
+
+    device_data = {
+        "cpu": f"{device_info['cpu']}",
+        "gpu": f"{device_info['gpu']}",
+        "os": f"{device_info['os']}",
+        "disk": f"{device_info['disk']}",
+        "memory": f"{device_info['memory']}",
+        "architecture": f"{device_info['architecture']}",
+    }
 
     try:
         with log.loading("Initializing device"):
-            initialize_response = request_to_endpoint(method="post", endpoint=initialize_endpoint, data=device_info, auth_token=access_token).json()
+            initialize_response = request_to_endpoint(method="put", endpoint=device_update_endpoint, data=device_data, auth_token=token)
     except Exception as e:
         log.error(f"Failed to initialize device: {e}")
 
-    if initialize_response.get("status") == "success":
+    if initialize_response.status_code == 200:
         log.success("Device information initialized successfully!")
-        server_endpoint = f"{host}/api/device/data/get-server"
-        try:
-            server_response = request_to_endpoint(method="get", endpoint=server_endpoint, auth_token=access_token)
-            file_id = server_response.json()
-            file_endpoint = f"{host}/api/storage/default/get-file?id={file_id}"
-            file_response = request_to_endpoint(method="get", endpoint=file_endpoint, auth_token=access_token)
-        except Exception as e:
-            log.error(f"Error while getting server files: {e}")
+        with log.loading("Building server"):
+            try:
+                server_response = request_to_endpoint(method="get", endpoint=device_update_endpoint, auth_token=access_token)
+                if server_response.status_code == 200:
+                    server_package = server_response.json()["server_package"]
+                else:
+                    log.error("Failed to get server package. Device not found.")
+                    return
 
-        extract_path = create_default_directory()
+                agent_endpoint = f"{formatted_host}api/storage/default/get-file?id={server_package}"
+                agent_response = request_to_endpoint(method="get", endpoint=agent_endpoint, auth_token=access_token)
 
-        extract_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                log.error(f"Error while getting server package: {e}")
+                return
 
-        zip_path = extract_path / "temp.zip"
+            extract_path = create_agent()
+
+            extract_path.mkdir(parents=True, exist_ok=True)
+
+            zip_path = extract_path / "temp.zip"
         try:
             with open(zip_path, "wb") as f:
-                f.write(file_response.content)
+                f.write(agent_response.content)
 
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_path)
@@ -355,7 +445,6 @@ def install(device_type, token, host):
                 f.writelines(lines)
 
             try:
-                deploy_endpoint = f"{host}/api/device/deploy/{id_deploy}"
                 image_exist = subprocess.run(["docker", "images", "-q", "diginova-wsl"], capture_output=True, text=True)
                 if not image_exist.stdout.strip():
                     server_path = Path.home() / ".novavision" / "Server"
@@ -370,7 +459,7 @@ def install(device_type, token, host):
                         build_context = agent_folder / Path(info["context"])
                         dockerfile = build_context / "Dockerfile.prod"
                         if dockerfile.exists():
-                            log.info(f"Building Docker image {image_name} from {dockerfile}...")
+                            log.info("Building Docker image...")
                             subprocess.run(
                                 ["docker", "build", "-t", image_name, "-f", str(dockerfile), str(build_context)],
                                 check=True
@@ -383,13 +472,14 @@ def install(device_type, token, host):
                 deploy_data = {"is_deploy": 1}
                 try:
                     with log.loading("Sending deployment status"):
-                        deploy_response = request_to_endpoint(method="put", endpoint=deploy_endpoint, data=deploy_data, auth_token=access_token)
+                        deploy_response = request_to_endpoint(method="put", endpoint=device_update_endpoint, data=deploy_data, auth_token=token)
 
                     if deploy_response:
                         if deploy_response.status_code == 200:
                             log.success("Deployment status updated successfully!")
                         else:
                             log.error(f"Deployment failed! {deploy_response.text}")
+                            return
                     else:
                         log.error("Deployment request failed: No response received from the server.")
                 except requests.exceptions.RequestException as e:
@@ -448,26 +538,30 @@ def manage_docker(command, type):
 
             current_containers = result.stdout.strip().split("\n")
             new_containers = []
+
             for container in current_containers:
                 parts = container.split(" ", 2)
                 container_id = parts[0]
                 container_name = parts[1]
                 container_ports = parts[2] if len(parts) > 2 else "No ports"
+
                 if container_id not in previous_containers:
+                    ports = []
+
                     for mapping in container_ports.split(", "):
                         if "->" in mapping:
-                            port = mapping.split("->")[1].split("/")[0].strip()
+                            ports.append(mapping.split("->")[1].split("/")[0].strip())
 
-                    port_display = ", ".join(port) if port else "No ports"
+                    port_display = ", ".join(ports) if ports else "Not Exposed to Host"
                     new_containers.append((container_name, port_display))
-
 
             if new_containers:
                 log.info("Started containers:")
                 for name, ports in new_containers:
-                    log.info(f"- {name} -> Port: {port}")
+                    log.info(f"- {name} -> Ports: {ports}")
             else:
                 log.warning("No containers started.")
+
 
         else:
             subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down"], check=True)
@@ -487,6 +581,7 @@ def main():
                                help="Select and Configure Device Type")
     install_parser.add_argument("token", help="User Authentication Token")
     install_parser.add_argument("--host", default="https://alfa.suite.novavision.ai", help="Host Url")
+    install_parser.add_argument("--workspace", default=None, help="Workspace Name")
 
     start_parser = subparsers.add_parser("start", help="Start Docker Container")
     start_parser.add_argument("type", choices=["server", "app"])
@@ -504,7 +599,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "install":
-        install(device_type=args.device_type, token=args.token, host=args.host)
+        install(device_type=args.device_type, token=args.token, host=args.host, workspace=args.workspace)
     elif args.command == "start" or args.command == "stop":
         if (args.type == "app" and args.id) or args.type == "server":
             manage_docker(command=args.command, type=args.type)

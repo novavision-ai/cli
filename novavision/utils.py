@@ -4,6 +4,7 @@ import GPUtil
 import hashlib
 import platform
 import subprocess
+import socket
 
 
 def get_cpu_info():
@@ -102,6 +103,8 @@ def get_system_info():
 
         serial = generate_serial()
 
+        hostname = socket.gethostname()
+
         return {
             "cpu": cpu,
             "gpu": gpu,
@@ -109,7 +112,8 @@ def get_system_info():
             "disk": disk_info,
             "memory": memory_info,
             "architecture": architecture,
-            "serial": serial
+            "serial": serial,
+            "device_name": hostname,
         }
     except Exception as e:
         return {
