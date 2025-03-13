@@ -11,7 +11,7 @@ NovaVision simplifies the process of setting up and managing servers, allowing y
 Install NovaVision CLI using pip:
 
 ```bash
-pip install novavision-cli
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple --no-cache-dir novavision-cli
 ```
 
 ---
@@ -19,19 +19,20 @@ pip install novavision-cli
 ## Features
 
 ### **install**  
-Registers a server (edge, local, or cloud) in your system and performs its installation on the device.
+Performs creation and installation of a device on your system.
 
 ```bash
-novavision install [edge|local|cloud] <USER_TOKEN>
+novavision install [edge|local|cloud] <USER_TOKEN> --host <HOST> --workspace <USER_WORKSPACE_NAME>
 ```
 
 **Parameters**  
-- `device-type`: Specifies the server type. Options: `edge`, `local`, or `cloud`.  
+- `DEVICE_TYPE`: Specifies the server type. Options: `edge`, `local`, or `cloud`.  
 - `USER_TOKEN`: User token required for registering and installing the server.
-
+- `--host`: User can specify which host will be used for creating device. Default: `alfa.suite.novavision.ai`. Choices: `alfa.suite.novavision.ai | dev.suite.novavision.ai | suite.novavision.ai`
+- `--workspace`: User can specify which workspace will be used for creating device. User must type the name of the workspace they have. If this parameter is not entered, workspace selection will be performed while device creation. 
 ---
 
-### **start**  
+### **novavision start**  
 Launches the server's or application's Docker Compose environment, starting the server or application if it isn’t already running.
 
 ```bash

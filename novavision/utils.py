@@ -1,14 +1,50 @@
 import os
 import psutil
-import GPUtil
 import hashlib
 import platform
 import subprocess
 import socket
 
+system = platform.system()
+
+def get_gpu_info():
+    if system == "Linux":
+        try:
+            output = subprocess.check_output("nvidia-smi --query-gpu=name --format=csv,noheader", shell=True).decode().strip()
+            if output:
+                return output
+        except:
+            pass
+
+        try:
+            subprocess.call("sudo update-pciids", shell=True)
+            output = subprocess.check_output("lspci | grep VGA", shell=True).decode().strip()
+            return output.split(":")[2].strip() if ":" in output else "GPU not found"
+        except:
+            pass
+
+    elif system == "Windows":
+        try:
+            command = "powershell -command \"Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name\""
+            result = subprocess.check_output(command, shell=True).decode('utf-8', errors='ignore').strip()
+            return result.split('\n')
+        except:
+            pass
+
+    elif system == "Darwin":
+        try:
+            output = subprocess.check_output(
+                "system_profiler SPDisplaysDataType | grep 'Chipset Model' | awk -F: '{print $2}' | xargs",
+                shell=True
+            ).decode().strip()
+            return output if output else "GPU not found"
+        except:
+            pass
+
+    return "GPU not found"
 
 def get_cpu_info():
-    if platform.system() == "Windows":
+    if system == "Windows":
         try:
             import winreg
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
@@ -18,7 +54,7 @@ def get_cpu_info():
         except:
             pass
 
-    elif platform.system() == "Linux":
+    elif system == "Linux":
         try:
             with open("/proc/cpuinfo") as f:
                 for line in f:
@@ -27,7 +63,7 @@ def get_cpu_info():
         except:
             pass
 
-    elif platform.system() == "Darwin":  # macOS
+    elif system == "Darwin":  # macOS
         try:
             output = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).decode()
             return output.strip()
@@ -37,7 +73,6 @@ def get_cpu_info():
     return platform.processor() or "Unknown CPU"
 
 def get_os_info():
-    system = platform.system()
     if system == "Linux":
         try:
             distro_info = {}
@@ -61,35 +96,90 @@ def get_os_info():
     else:
         return f"{system} {platform.release()}"
 
-def get_mac_address():
+def get_device_platform():
+    if os.path.exists('/etc/nv_tegra_release'):
+        return "Jetson"
 
-    for interface, addrs in psutil.net_if_addrs().items():
-        for addr in addrs:
-            if addr.family == psutil.AF_LINK:
-                return addr.address.upper().replace(":", "").replace("-", "")
-    return None
+    if os.path.exists('/sys/firmware/devicetree/base/model'):
+        try:
+            with open('/sys/firmware/devicetree/base/model', 'r') as f:
+                model = f.read().strip('\0').lower()
+                if "raspberry pi" in model:
+                    return "Raspberry Pi"
+        except Exception:
+            pass
 
-def generate_serial():
-    mac = get_mac_address()
-    if not mac:
-        return "UNKNOWN"
+    if system == "Darwin":
+        return "Mac"
 
-    mac_bytes = mac.encode()
-    hash_value = hashlib.sha256(mac_bytes).hexdigest()
-    serial = hash_value[:8].upper()
-    return serial
+    if system == "Windows" or system == "Linux":
+        return "PC"
+
+    return "Unknown"
+
+def get_device_name():
+    if system == "Darwin":
+        import subprocess
+        result = subprocess.check_output(['scutil', '--get', 'ComputerName'], text=True)
+        return result.split(' (')[0] if ' (' in result and result.endswith(')') else result
+    elif system == "Windows":
+        return os.environ.get('COMPUTERNAME', socket.gethostname())
+    elif system == "Linux":
+        return socket.gethostname()
+    else:
+        return socket.gethostname()
+
+
+def get_serial():
+
+    try:
+        if system == "Windows":
+            result = subprocess.run(["powershell", "-command", "(Get-WmiObject Win32_BIOS).SerialNumber"],
+                                    capture_output=True, text=True, check=True)
+            serial = result.stdout.strip()
+
+        elif system == "Darwin":  # macOS
+            result = subprocess.run(["system_profiler", "SPHardwareDataType"], capture_output=True, text=True,
+                                    check=True)
+            serial = ""
+            for line in result.stdout.split("\n"):
+                if "Serial Number" in line:
+                    serial = line.split(":")[-1].strip()
+                    break
+
+        elif system == "Linux":
+            result = subprocess.run(["cat", "/var/lib/dbus/machine-id"],
+                                    capture_output=True, text=True, check=True)
+            serial = result.stdout.strip()
+
+        else:
+            return None
+
+        hash_obj = hashlib.sha256(serial.encode())
+        hex_digest = hash_obj.hexdigest()
+
+        short_serial = hex_digest[:8].upper()
+
+        return short_serial
+
+    except Exception as e:
+        return e
+
 
 def get_system_info():
     try:
         cpu = get_cpu_info()
 
-        try:
-            gpus = GPUtil.getGPUs()
-            gpu = gpus[0].name if gpus else "GPU not found"
-        except:
-            gpu = "GPU information unavailable"
+        gpu = get_gpu_info()
 
         os_info = get_os_info()
+
+        if gpu != "GPU not found":
+            processor = "gpu"
+        elif gpu == "GPU not found" and cpu != "Unknown CPU":
+            processor = "cpu"
+        else:
+            processor = "Failed to get processor information."
 
         disk = psutil.disk_usage('/')
         total_disk = f"{disk.total / (1024 ** 3):.2f}G"
@@ -101,19 +191,23 @@ def get_system_info():
 
         architecture = platform.machine()
 
-        serial = generate_serial()
+        serial = get_serial()
 
-        hostname = socket.gethostname()
+        device_name = get_device_name()
+
+        device_platform = get_device_platform()
 
         return {
             "cpu": cpu,
             "gpu": gpu,
             "os": os_info,
+            "serial": serial,
             "disk": disk_info,
             "memory": memory_info,
+            "processor": processor,
+            "device_name": device_name,
+            "platform": device_platform,
             "architecture": architecture,
-            "serial": serial,
-            "device_name": hostname,
         }
     except Exception as e:
         return {
