@@ -78,7 +78,7 @@ def remove_directory(path):
             )
             subprocess.run(["rm", "-rf", path], check=True)
     except Exception as e:
-        print(f"Failed to remove {path}: {e}")
+        log.error(f"Failed to remove {path}: {e}")
 
 def get_docker_build_info(compose_file):
     try:
@@ -238,7 +238,6 @@ def register_device_with_retry(data, token, host, device_info):
             register_response = request_to_endpoint(method="post", endpoint=register_endpoint, data=data, auth_token=token)
 
         try:
-            print(register_response)
             register_json = register_response.json()
         except Exception as e:
             log.error(f"Error occurred while device registration: {e}")
@@ -311,6 +310,7 @@ def register_device_with_retry(data, token, host, device_info):
 
 def install(device_type, token, host, workspace):
     formatted_host = format_host(host)
+    os.chdir(os.path.expanduser("~"))
     device_info = get_system_info()
     server_path = Path.home() / ".novavision" / "Server"
 
@@ -388,7 +388,7 @@ def install(device_type, token, host, workspace):
             item_path = os.path.join(str(server_folder), item)
             if os.path.isdir(item_path) and pattern.match(item):
                 app_name = item
-                manage_docker("stop", "app")
+                manage_docker("stop", "app", app_name)
 
         manage_docker("stop", "server")
         if app_name is not None:
@@ -427,7 +427,7 @@ def install(device_type, token, host, workspace):
             wan_host = log.question("Enter WAN HOST").strip()
 
         else:
-            print("Invalid input. Using detected WAN HOST...")
+            log.warning("Invalid input. Using detected WAN HOST...")
 
         user_port = log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
 
@@ -631,7 +631,7 @@ def deploy(type, id, to):
     # App deployu ve agent'ın içerisine konulması
     pass
 
-def manage_docker(command, type):
+def manage_docker(command, type, app_name=None):
     default_path = Path.home() / ".novavision"
     server_path = default_path / "Server"
     docker_compose_files = []
@@ -699,21 +699,18 @@ def manage_docker(command, type):
             else:
                 log.warning("No containers started.")
 
-
         else:
             if type == "server":
                 subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down"], check=True)
                 log.success("Server stopped.")
-
             else:
                 with log.loading("Stopping App"):
                     try:
                         result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}}"], capture_output=True, text=True, check=True)
-
                         if result.returncode != 0:
                             for line in result.stdout.strip().split("\n"):
                                 container_id, container_name = line.split(" ", 1)
-                                if "80D87D" in container_name:
+                                if app_name in container_name:
                                     subprocess.run(["docker", "stop", container_id], check=True)
 
                     except subprocess.CalledProcessError as e:
