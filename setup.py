@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name='novavision-cli',
-    version='0.1.23',
+    version='0.1.30',
     packages=find_packages(),
     include_package_data=True,
     install_requires=["requests==2.32.3",
@@ -14,6 +14,8 @@ setup(
                       "docker>=6.1.3,<7",
                       "rich==13.9.4",
                       "pyyaml==6.0.2"],
+    extras_require={
+        ":sys_platform=='darwin'": ["pyobjc"]},
     entry_points={
         'console_scripts': ['novavision=novavision.cli:main'],
     },

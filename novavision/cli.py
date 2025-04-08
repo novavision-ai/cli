@@ -2,7 +2,6 @@ import os
 import re
 import stat
 import yaml
-import docker
 import shutil
 import zipfile
 import argparse
@@ -37,10 +36,11 @@ def request_to_endpoint(method, endpoint, data=None, auth_token=None):
             log.error(f"Invalid HTTP method: {method}")
             return None
 
-        response.raise_for_status()
+        response = response.response if hasattr(response, 'response') else response
         return response
     except Exception as e:
         if response:
+            response = response.response if hasattr(response, 'response') else response
             return response
         else:
             return e
@@ -105,23 +105,24 @@ def get_docker_build_info(compose_file):
 
 def choose_server_folder(server_path):
     server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+    visible_folders = [f for f in server_folders if not f.name.startswith(".")]
 
     if not server_folders:
         log.error("No server folders found!")
         return None
 
-    if len(server_folders) == 1:
+    if len(server_folders) == 1 or len(visible_folders) == 1:
         return server_folders[0]
 
     log.info("Multiple server folders found. Please select one:")
 
-    for idx, folder in enumerate(server_folders):
+    for idx, folder in enumerate(visible_folders):
         log.info(f"{idx + 1}. {folder.name}")
 
     while True:
         try:
             choice = int(log.question("Enter the number of the server you want."))
-            if 1 <= choice <= len(server_folders):
+            if 1 <= choice <= len(visible_folders):
                 return server_folders[choice - 1]
             else:
                 log.warning("Invalid selection. Please enter a valid number.")
@@ -187,7 +188,6 @@ def delete_old_containers(key):
 
 def register_device_with_retry(data, token, host, device_info):
     register_endpoint = f"{host}api/device/default?expand=user"
-
     while True:
         device_endpoint = f"{host}api/device/default"
         device_response = request_to_endpoint(method="get", endpoint=device_endpoint, auth_token=token)
@@ -256,7 +256,6 @@ def register_device_with_retry(data, token, host, device_info):
 
             if error_code == 0:
                 error_data = register_json.get("error", {})
-
                 if not isinstance(error_data, dict):
                     log.error("The object 'error' cannot be found or is not in dict format.")
                     log.error(f"Full response: {register_json}")
@@ -280,18 +279,12 @@ def register_device_with_retry(data, token, host, device_info):
                         if 1 <= choice <= len(device_response):
                             device_id_to_delete = device_response[choice - 1]['id_device']
                             break
-
                         else:
                             log.warning("Invalid selection. Please select a number from the list.")
-
                     except ValueError:
                         log.warning("Invalid entry. Please enter a number.")
 
-                ans = log.question("")
-
                 delete_endpoint = f"{host}api/device/default/{device_id_to_delete}"
-
-
                 with log.loading("Removing device"):
                     delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
 
@@ -299,11 +292,9 @@ def register_device_with_retry(data, token, host, device_info):
                     log.success(f"Device '{device_response[choice - 1]['name']}' removed successfully.")
                     log.info("Trying registration again.")
                     continue
-
                 else:
                     log.error("Device removal failed!")
                     return None
-
         else:
             log.error(f"Unexpected error occurred. Error: {register_response.text}")
             return None
@@ -331,10 +322,11 @@ def install(device_type, token, host, workspace):
 
     try:
         if workspace_list_response.status_code != 200:
-            log.error(f"Workspace list request failed. Error: {workspace_list_response.text}")
+            log.error(f"Workspace list request failed. Error: {workspace_list_response.json()['message']}")
             return
     except Exception as e:
         log.error(f"Error occurred while getting workspace list: {e}")
+        return
 
     workspace_list = workspace_list_response.json()
 
@@ -345,6 +337,7 @@ def install(device_type, token, host, workspace):
 
         if len(workspace_list) == 1:
             log.info("There is only one workspace available. Continuing registration.")
+            workspace_id_to_select = workspace_list[0]["id_workspace_user"]
 
         else:
             log.info("There are multiple workspaces available for user. Current workspaces available:")
@@ -484,7 +477,7 @@ def install(device_type, token, host, workspace):
         access_token = register_response["user"]["access_token"]
         id_device = register_response["id_device"]
 
-        id_deploy_endpoint = f"{formatted_host}api/device/deploy/index?filter[id_device][eq]={id_device}&sort=id_deploy"
+        id_deploy_endpoint = f"{formatted_host}api/deployment?filter[id_device][eq]={id_device}&sort=id_deploy"
         id_deploy_response = request_to_endpoint(method="get", endpoint=id_deploy_endpoint, auth_token=token).json()
         id_deploy = id_deploy_response[0]["id_deploy"]
 
@@ -572,28 +565,12 @@ def install(device_type, token, host, workspace):
             if not compose_file.exists():
                 log.error(f"No docker-compose.yml found in {agent_folder}!")
 
-            build_info = get_docker_build_info(compose_file)
-
-            for service, info in build_info.items():
-                image_name = info["image"]
-                build_context = agent_folder / Path(info["context"])
-                dockerfile = build_context / "Dockerfile.prod"
-
-                if dockerfile.exists():
-                    log.info("Building Docker image...")
-                    subprocess.run(
-                        ["docker", "build", "-t", image_name, "-f", str(dockerfile), str(build_context)],
-                        check=True
-                    )
-                    log.success("Docker image built successfully!")
-
-                else:
-                    log.error("Dockerfile.prod can not found!")
+            subprocess.run(["docker", "compose", "-f", str(compose_file), "up", "-d"], check=True)
 
             log.success("Server built successfully!")
             deploy_data = {"is_deploy": 1}
             try:
-                agent_deploy_endpoint = f"{formatted_host}api/device/deploy/{id_deploy}"
+                agent_deploy_endpoint = f"{formatted_host}api/deployment/default/{id_deploy}"
                 with log.loading("Sending agent deployment status"):
                     agent_deploy_response = request_to_endpoint(method="put", endpoint=agent_deploy_endpoint, data=deploy_data, auth_token=token)
 
@@ -614,6 +591,10 @@ def install(device_type, token, host, workspace):
             except Exception as e:
                 log.error(f"An unexpected error occurred during deployment: {e}")
 
+        except subprocess.CalledProcessError as e:
+            log.error(f"Docker Compose failed with error code {e.returncode}")
+            log.error(f"Standard Output:\n{e.stdout}")
+            log.error(f"Standard Error:\n{e.stderr}")
         except Exception as e:
             log.error(f"Error during building server: {str(e)}")
 
@@ -701,7 +682,7 @@ def manage_docker(command, type, app_name=None):
 
         else:
             if type == "server":
-                subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down"], check=True)
+                subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
                 log.success("Server stopped.")
             else:
                 with log.loading("Stopping App"):

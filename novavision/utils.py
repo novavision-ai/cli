@@ -12,14 +12,16 @@ def get_gpu_info():
         try:
             output = subprocess.check_output("nvidia-smi --query-gpu=name --format=csv,noheader", shell=True).decode().strip()
             if output:
-                return output
+                processor = "gpu"
+                return output, processor
         except:
             pass
 
         try:
             subprocess.call("sudo update-pciids", shell=True)
             output = subprocess.check_output("lspci | grep VGA", shell=True).decode().strip()
-            return output.split(":")[2].strip() if ":" in output else "GPU not found"
+            processor = "gpu"
+            return output.split(":")[2].strip(), processor
         except:
             pass
 
@@ -27,21 +29,23 @@ def get_gpu_info():
         try:
             command = "powershell -command \"Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name\""
             result = subprocess.check_output(command, shell=True).decode('utf-8', errors='ignore').strip()
-            return result.split('\n')
+            processor = "gpu"
+            return result.split('\n'), processor
         except:
             pass
 
     elif system == "Darwin":
         try:
-            output = subprocess.check_output(
-                "system_profiler SPDisplaysDataType | grep 'Chipset Model' | awk -F: '{print $2}' | xargs",
-                shell=True
-            ).decode().strip()
-            return output if output else "GPU not found"
+            import Metal
+            device = Metal.MTLCreateSystemDefaultDevice()
+            if device:
+                processor = "mps"
+                return device.name(), processor
         except:
             pass
 
-    return "GPU not found"
+    processor = "cpu"
+    return "GPU not found", processor
 
 def get_cpu_info():
     if system == "Windows":
@@ -169,17 +173,8 @@ def get_serial():
 def get_system_info():
     try:
         cpu = get_cpu_info()
-
-        gpu = get_gpu_info()
-
+        gpu, processor = get_gpu_info()
         os_info = get_os_info()
-
-        if gpu != "GPU not found":
-            processor = "gpu"
-        elif gpu == "GPU not found" and cpu != "Unknown CPU":
-            processor = "cpu"
-        else:
-            processor = "Failed to get processor information."
 
         disk = psutil.disk_usage('/')
         total_disk = f"{disk.total / (1024 ** 3):.2f}G"
