@@ -254,8 +254,10 @@ def register_device_with_retry(data, token, host, device_info):
         elif register_response.status_code in [400, 403]:
             error_code = register_json.get("code", None)
 
-            if error_code == 0:
+            if error_code:
                 error_data = register_json.get("error", {})
+
+            if error_code == 0:
                 if not isinstance(error_data, dict):
                     log.error("The object 'error' cannot be found or is not in dict format.")
                     log.error(f"Full response: {register_json}")
@@ -265,7 +267,7 @@ def register_device_with_retry(data, token, host, device_info):
                 log.error(f"Device registration failed: {error_message}")
                 return None
 
-            else:
+            elif error_code == 1:
                 log.warning("User exceeds the maximum limit of device! Device removal is needed.")
 
                 log.info("Current devices:")
@@ -295,6 +297,11 @@ def register_device_with_retry(data, token, host, device_info):
                 else:
                     log.error("Device removal failed!")
                     return None
+
+            else:
+                log.error(f"Unexpected response from server: {error_data}")
+                log.error("Please contact system administrator.")
+                return None
         else:
             log.error(f"Unexpected error occurred. Error: {register_response.text}")
             return None
@@ -308,11 +315,9 @@ def install(device_type, token, host, workspace):
     try:
         subprocess.run(["docker", "info"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         pass
-
     except subprocess.CalledProcessError:
         log.error("Docker is not running. Please activate docker first.")
         return
-
     except FileNotFoundError:
         log.error("Docker is not installed")
         return
@@ -350,24 +355,19 @@ def install(device_type, token, host, workspace):
                     if 1 <= choice <= len(workspace_list):
                         workspace_id_to_select = workspace_list[choice - 1]['id_workspace_user']
                         break
-
                     else:
                         log.warning("Invalid selection. Please select a number from the list.")
-
                 except ValueError:
                     log.warning("Invalid entry. Please enter a number.")
     else:
         workspace_to_select = [workspaces for workspaces in workspace_list if workspaces["workspace"]["name"] == workspace]
         workspace_id_to_select = workspace_to_select[0]["id_workspace_user"]
 
-
     set_workspace_endpoint = f"{formatted_host}api/workspace/user/{workspace_id_to_select}"
     workspace_data = {"status": 1}
     set_workspace_response = request_to_endpoint(method="put", endpoint=set_workspace_endpoint, data=workspace_data, auth_token=token)
-
     if set_workspace_response.status_code == 200:
         log.success("Workspace set successfully!")
-
     else:
         log.error(f"Workspace set failed! Error: {set_workspace_response.text}")
         return
@@ -386,7 +386,6 @@ def install(device_type, token, host, workspace):
         manage_docker("stop", "server")
         if app_name is not None:
             delete_containers = delete_old_containers(key=app_name)
-
             if delete_containers is None:
                 return None
 
@@ -398,13 +397,11 @@ def install(device_type, token, host, workspace):
                     break
                 except Exception as e:
                     log.error(f"Server file deletion failed: {e}")
-
             elif delete == "n":
                 log.warning("Aborting.")
                 return
             else:
                 log.warning("Invalid input. Try again.")
-
 
     if device_type == "cloud":
         response = request_to_endpoint(method="get", endpoint="https://api.ipify.org?format=text")
@@ -415,10 +412,8 @@ def install(device_type, token, host, workspace):
 
         if user_wan_ip == "y":
             log.info("Using detected WAN HOST...")
-
         elif user_wan_ip == "n":
             wan_host = log.question("Enter WAN HOST").strip()
-
         else:
             log.warning("Invalid input. Using detected WAN HOST...")
 
@@ -426,10 +421,8 @@ def install(device_type, token, host, workspace):
 
         if user_port == "y":
             port = "7001"
-
         elif user_port == "n":
             port = log.question("Please enter desired port")
-
         else:
             log.error("Invalid input.")
 
@@ -446,7 +439,7 @@ def install(device_type, token, host, workspace):
             "architecture": f"{device_info['architecture']}",
             "platform": f"{device_info['platform']}",
             "os_api_port": f"{port}",
-            "wan_host": f"{wan_host}",
+            "wan_host": f"{wan_host}"
         }
 
     elif device_type == "local":
@@ -469,14 +462,12 @@ def install(device_type, token, host, workspace):
         return
 
     register_response = register_device_with_retry(data=data, token=token, host=formatted_host, device_info=device_info)
-
     if register_response is None:
         return
 
     try:
         access_token = register_response["user"]["access_token"]
         id_device = register_response["id_device"]
-
         id_deploy_endpoint = f"{formatted_host}api/deployment?filter[id_device][eq]={id_device}&sort=id_deploy"
         id_deploy_response = request_to_endpoint(method="get", endpoint=id_deploy_endpoint, auth_token=token).json()
         id_deploy = id_deploy_response[0]["id_deploy"]
@@ -492,23 +483,19 @@ def install(device_type, token, host, workspace):
             server_response = request_to_endpoint(method="get", endpoint=server_endpoint, auth_token=access_token)
             if server_response.status_code == 200:
                 server_package = server_response.json()["server_package"]
-
             else:
                 log.error(f"Failed to get server package: {server_response.text}")
                 return
-
             agent_endpoint = f"{formatted_host}api/storage/default/get-file?id={server_package}"
             agent_response = request_to_endpoint(method="get", endpoint=agent_endpoint, auth_token=access_token)
-
         except Exception as e:
             log.error(f"Error while getting server package: {e}")
             return
 
         extract_path = create_agent()
-
         extract_path.mkdir(parents=True, exist_ok=True)
-
         zip_path = extract_path / "temp.zip"
+
     try:
         with open(zip_path, "wb") as f:
             f.write(agent_response.content)
@@ -519,23 +506,18 @@ def install(device_type, token, host, workspace):
         deploy_data = {"is_deploy": 1}
         try:
             with log.loading("Sending device deployment status"):
-                device_deploy_response = request_to_endpoint(method="put", endpoint=server_endpoint, data=deploy_data,
-                                                             auth_token=token)
-
+                device_deploy_response = request_to_endpoint(method="put", endpoint=server_endpoint, data=deploy_data, auth_token=token)
             if device_deploy_response:
                 if device_deploy_response.status_code == 200:
                     log.success("Device deployment status updated successfully!")
-
                 else:
                     log.error(f"Device deployment failed! {device_deploy_response.text}")
                     return
-
             else:
                 log.error("Deployment request failed: No response received from the server.")
 
         except requests.exceptions.RequestException as e:
             log.error(f"Deployment request failed due to a network error: {e}")
-
         except Exception as e:
             log.error(f"An unexpected error occurred during deployment: {e}")
 
@@ -547,10 +529,8 @@ def install(device_type, token, host, workspace):
             with open(env_file, "r") as f:
                 lines = f.readlines()
             lines = [f"{key}={value}\n" if line.startswith(f"{key}=") else line for line in lines]
-
             if not any(line.startswith(f"{key}=") for line in lines):
                 lines.append(f"{key}={value}\n")
-
         else:
             lines = [f"{key}={value}\n"]
 
@@ -561,56 +541,42 @@ def install(device_type, token, host, workspace):
             server_folder = [item for item in server_path.iterdir() if item.is_dir()]
             agent_folder = max(server_folder, key=lambda folder: folder.stat().st_mtime)
             compose_file = agent_folder / "docker-compose.yml"
-
             if not compose_file.exists():
                 log.error(f"No docker-compose.yml found in {agent_folder}!")
 
-            subprocess.run(["docker", "compose", "-f", str(compose_file), "up", "-d"], check=True)
-
+            subprocess.run(["docker", "compose", "-f", str(compose_file), "build", "--no-cache"], check=True)
             log.success("Server built successfully!")
             deploy_data = {"is_deploy": 1}
+
             try:
                 agent_deploy_endpoint = f"{formatted_host}api/deployment/default/{id_deploy}"
                 with log.loading("Sending agent deployment status"):
                     agent_deploy_response = request_to_endpoint(method="put", endpoint=agent_deploy_endpoint, data=deploy_data, auth_token=token)
-
                 if agent_deploy_response:
                     if agent_deploy_response.status_code == 200:
                         log.success("Agent deployment status updated successfully!")
-
                     else:
                         log.error(f"Agent deployment failed! {agent_deploy_response.text}")
                         return
-
                 else:
                     log.error("Deployment request failed: No response received from the server.")
-
             except requests.exceptions.RequestException as e:
                 log.error(f"Deployment request failed due to a network error: {e}")
-
             except Exception as e:
                 log.error(f"An unexpected error occurred during deployment: {e}")
-
         except subprocess.CalledProcessError as e:
             log.error(f"Docker Compose failed with error code {e.returncode}")
-            log.error(f"Standard Output:\n{e.stdout}")
-            log.error(f"Standard Error:\n{e.stderr}")
+            log.error(f"Error:\n{e.stderr}")
         except Exception as e:
             log.error(f"Error during building server: {str(e)}")
 
     except zipfile.BadZipFile:
         log.error("Error: The downloaded file is not a valid zip file")
-
     except Exception as e:
         log.error(f"Error during extraction: {str(e)}")
-
     finally:
         if zip_path.exists():
             os.remove(zip_path)
-
-def deploy(type, id, to):
-    # App deployu ve agent'ın içerisine konulması
-    pass
 
 def manage_docker(command, type, app_name=None):
     default_path = Path.home() / ".novavision"
@@ -621,54 +587,37 @@ def manage_docker(command, type, app_name=None):
         if command == "start":
             server_folder = choose_server_folder(server_path)
             docker_compose_file = server_folder / "docker-compose.yml"
-
         else:
             docker_compose_file = get_running_container_compose_file()
-
             if not docker_compose_file:
                 log.warning("No running server found to stop.")
                 return
-
     else:
         server_folder = choose_server_folder(server_path)
-
         for root, dirs, files in os.walk(server_folder):
             if Path(root) == server_folder:
                 continue
-
             if "docker-compose.yml" in files:
                 file_path = os.path.join(root, "docker-compose.yml")
                 docker_compose_files.append(file_path)
-
     try:
         if command == "start":
-            previous_containers = set(subprocess.run(
-                ["docker", "ps", "-q"],
-                capture_output=True, text=True
-            ).stdout.strip().split("\n"))
-
+            previous_containers = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True).stdout.strip().split("\n"))
             log.info("Starting server")
             subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
-            result = subprocess.run(
-                ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
-                capture_output=True, text=True)
-
+            result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"], capture_output=True, text=True)
             current_containers = result.stdout.strip().split("\n")
             new_containers = []
-
             for container in current_containers:
                 parts = container.split(" ", 2)
                 container_id = parts[0]
                 container_name = parts[1]
                 container_ports = parts[2] if len(parts) > 2 else "No ports"
-
                 if container_id not in previous_containers:
                     ports = []
-
                     for mapping in container_ports.split(", "):
                         if "->" in mapping:
                             ports.append(mapping.split("->")[1].split("/")[0].strip())
-
                     port_display = ", ".join(ports) if ports else "Not Exposed to Host"
                     new_containers.append((container_name, port_display))
 
@@ -719,11 +668,6 @@ def main():
     start_parser.add_argument("type", choices=["server", "app"])
     start_parser.add_argument("--id", help="AppID for App Choice", required=False)
 
-    deploy_parser = subparsers.add_parser("deploy", help="Deploying App")
-    deploy_parser.add_argument("type", choices="app")
-    deploy_parser.add_argument("--id", help="AppID for Which App Will Be Deployed", required=False)
-    deploy_parser.add_argument("token", help="User Authentication Token")
-
     stop_parser = subparsers.add_parser("stop", help="Stops server | app")
     stop_parser.add_argument("type", choices=["server", "app"])
     stop_parser.add_argument("--id", help="AppID for App Choice", required=False)
@@ -732,18 +676,11 @@ def main():
 
     if args.command == "install":
         install(device_type=args.device_type, token=args.token, host=args.host, workspace=args.workspace)
-
     elif args.command == "start" or args.command == "stop":
         if (args.type == "app" and args.id) or args.type == "server":
             manage_docker(command=args.command, type=args.type)
-
         else:
             log.error("Invalid arguments!")
-
-    elif args.command == "deploy":
-        if args.type and args.id:
-            deploy(args.type, args.id, args.token)
-
     else:
         log.error("Invalid command!")
 
