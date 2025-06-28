@@ -135,7 +135,6 @@ def get_device_name():
 
 
 def get_serial():
-
     try:
         if system == "Windows":
             result = subprocess.run(["powershell", "-command", "(Get-WmiObject Win32_BIOS).SerialNumber"],

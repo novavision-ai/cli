@@ -80,6 +80,25 @@ def remove_directory(path):
     except Exception as e:
         log.error(f"Failed to remove {path}: {e}")
 
+def remove_network():
+    try:
+        result = subprocess.run(
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, check=True
+        )
+        network_names = result.stdout.strip().split("\n")
+        for net in network_names:
+            if net.endswith("-novavision"):
+                try:
+                    subprocess.run(["docker", "network", "rm", net], check=True)
+                    log.success(f"Removed network: {net}")
+                except subprocess.CalledProcessError:
+                    log.warning(f"Failed to remove network (maybe already removed): {net}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error(f"Error listing networks: {e}")
+        return False
+
 def get_docker_build_info(compose_file):
     try:
         with open(compose_file, "r") as file:
@@ -221,7 +240,8 @@ def register_device_with_retry(data, token, host, device_info):
                         break
 
                     else:
-                        log.error("Device removal failed!")
+                        log.error(f"Device removal failed: {delete_response.json().get('message')}")
+                        log.error("Please contact administrator.")
                         return None
 
                 elif remove == "n":
@@ -253,14 +273,16 @@ def register_device_with_retry(data, token, host, device_info):
 
         elif register_response.status_code in [400, 403]:
             error_code = register_json.get("code", None)
-
-            if error_code:
-                error_data = register_json.get("error", {})
+            try:
+                if error_code is not None:
+                    error_data = register_json.get("message", None)
+            except Exception:
+                error_data = None
 
             if error_code == 0:
                 if not isinstance(error_data, dict):
                     log.error("The object 'error' cannot be found or is not in dict format.")
-                    log.error(f"Full response: {register_json}")
+                    log.error(f"Error Data: {error_data}")
                     return None
 
                 error_message = register_json.get("message", "Unknown error occurred.")
@@ -299,7 +321,10 @@ def register_device_with_retry(data, token, host, device_info):
                     return None
 
             else:
-                log.error(f"Unexpected response from server: {error_data}")
+                if error_data is not None:
+                    log.error(f"Unexpected response from server: {error_data}")
+                else:
+                    log.error("Couldn't get response from server. Please contact administrator.")
                 log.error("Please contact system administrator.")
                 return None
         else:
@@ -366,6 +391,7 @@ def install(device_type, token, host, workspace):
     set_workspace_endpoint = f"{formatted_host}api/workspace/user/{workspace_id_to_select}"
     workspace_data = {"status": 1}
     set_workspace_response = request_to_endpoint(method="put", endpoint=set_workspace_endpoint, data=workspace_data, auth_token=token)
+
     if set_workspace_response.status_code == 200:
         log.success("Workspace set successfully!")
     else:
@@ -544,10 +570,13 @@ def install(device_type, token, host, workspace):
             if not compose_file.exists():
                 log.error(f"No docker-compose.yml found in {agent_folder}!")
 
-            subprocess.run(["docker", "compose", "-f", str(compose_file), "build", "--no-cache"], check=True)
+            if shutil.which("docker"):
+                subprocess.run(["docker", "compose", "-f", str(compose_file), "build", "--no-cache"], check=True)
+            elif shutil.which("docker-compose"):
+                subprocess.run(["docker-compose", "-f", str(compose_file), "build", "--no-cache"], check=True)
+
             log.success("Server built successfully!")
             deploy_data = {"is_deploy": 1}
-
             try:
                 agent_deploy_endpoint = f"{formatted_host}api/deployment/default/{id_deploy}"
                 with log.loading("Sending agent deployment status"):
@@ -581,31 +610,24 @@ def install(device_type, token, host, workspace):
 def manage_docker(command, type, app_name=None):
     default_path = Path.home() / ".novavision"
     server_path = default_path / "Server"
-    docker_compose_files = []
-
-    if type == "server":
-        if command == "start":
+    if command == "start":
+        if type == "server":
             server_folder = choose_server_folder(server_path)
             docker_compose_file = server_folder / "docker-compose.yml"
-        else:
-            docker_compose_file = get_running_container_compose_file()
-            if not docker_compose_file:
-                log.warning("No running server found to stop.")
-                return
-    else:
-        server_folder = choose_server_folder(server_path)
-        for root, dirs, files in os.walk(server_folder):
-            if Path(root) == server_folder:
-                continue
-            if "docker-compose.yml" in files:
-                file_path = os.path.join(root, "docker-compose.yml")
-                docker_compose_files.append(file_path)
-    try:
-        if command == "start":
+
             previous_containers = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True).stdout.strip().split("\n"))
+
             log.info("Starting server")
-            subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
-            result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"], capture_output=True, text=True)
+            try:
+                if shutil.which("docker"):
+                    subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                elif shutil.which("docker-compose"):
+                    subprocess.run(["docker-compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"], capture_output=True,
+                                        text=True)
+            except subprocess.CalledProcessError as e:
+                return log.error(f"Error starting server: {e}")
+
             current_containers = result.stdout.strip().split("\n")
             new_containers = []
             for container in current_containers:
@@ -628,28 +650,40 @@ def manage_docker(command, type, app_name=None):
 
             else:
                 log.warning("No containers started.")
+                return None
+        return None
 
-        else:
-            if type == "server":
+    else:
+        if type == "server":
+            server_folder = choose_server_folder(server_path)
+            docker_compose_file = server_folder / "docker-compose.yml"
+            if shutil.which("docker"):
                 subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
-                log.success("Server stopped.")
-            else:
-                with log.loading("Stopping App"):
-                    try:
-                        result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}}"], capture_output=True, text=True, check=True)
-                        if result.returncode != 0:
-                            for line in result.stdout.strip().split("\n"):
-                                container_id, container_name = line.split(" ", 1)
-                                if app_name in container_name:
-                                    subprocess.run(["docker", "stop", container_id], check=True)
+            elif shutil.which("docker-compose"):
+                subprocess.run(["docker-compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
+            log.success("Server stopped.")
+            ret = remove_network()
+            if ret:
+                log.success("Server network removed successfully.")
+            return None
+        elif type == "app":
+            with log.loading("Stopping App"):
+                try:
+                    result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}}"], capture_output=True, text=True, check=True)
+                    if result.returncode != 0:
+                        for line in result.stdout.strip().split("\n"):
+                            container_id, container_name = line.split(" ", 1)
+                            if app_name in container_name:
+                                subprocess.run(["docker", "stop", container_id], check=True)
 
-                    except subprocess.CalledProcessError as e:
-                        log.error(f"Error stopping app: {e}")
-
-                    log.success("All apps deployed in server stopped successfully.")
-
-    except subprocess.CalledProcessError as e:
-        log.error(f"Error while managing docker compose: {e}")
+                except subprocess.CalledProcessError as e:
+                    log.error(f"Error stopping app: {e}")
+                ret = remove_network()
+                if ret:
+                    log.success("App network removed successfully.")
+                log.success("All apps deployed in server stopped successfully.")
+                return None
+        return None
 
 
 def main():
