@@ -271,62 +271,76 @@ def register_device_with_retry(data, token, host, device_info):
             log.success("Device registered successfully!")
             return register_json
 
+
         elif register_response.status_code in [400, 403]:
             error_code = register_json.get("code", None)
+            error = register_json.get("error", None)
+
+            if error is not None:
+                if isinstance(error, dict):
+                    for value in error.values():
+                        log.error(f"Device registration failed: {str(value[0])}")
+                else:
+                    log.error(f"Device registration failed: {error}")
+                return None
+
             try:
                 if error_code is not None:
                     error_data = register_json.get("message", None)
-            except Exception:
-                error_data = None
+                    if error_code == 0:
+                        if not isinstance(error_data, dict):
+                            log.error("The object 'error' cannot be found or is not in dict format.")
+                            log.error(f"Error Data: {error_data}")
+                            return None
 
-            if error_code == 0:
-                if not isinstance(error_data, dict):
-                    log.error("The object 'error' cannot be found or is not in dict format.")
-                    log.error(f"Error Data: {error_data}")
-                    return None
+                        error_message = register_json.get("message", "Unknown error occurred.")
+                        log.error(f"Device registration failed: {error_message}")
+                        return None
 
-                error_message = register_json.get("message", "Unknown error occurred.")
-                log.error(f"Device registration failed: {error_message}")
-                return None
+                    elif error_code == 1:
+                        log.warning("User exceeds the maximum limit of device! Device removal is needed.")
+                        log.info("Current devices:")
 
-            elif error_code == 1:
-                log.warning("User exceeds the maximum limit of device! Device removal is needed.")
+                        for idx, device in enumerate(device_response):
+                            device_type = {1: "cloud", 2: "edge"}.get(device["device_type"], "local")
+                            log.info(f"{idx + 1}. {device['name']} (Device type: {device_type})")
 
-                log.info("Current devices:")
-                for idx, device in enumerate(device_response):
-                    device_type = {1: "cloud", 2: "edge"}.get(device["device_type"], "local")
-                    log.info(f"{idx + 1}. {device['name']} (Device type: {device_type})")
+                        while True:
+                            try:
+                                choice = int(log.question("Please select a device to remove"))
+                                if 1 <= choice <= len(device_response):
+                                    device_id_to_delete = device_response[choice - 1]['id_device']
+                                    break
 
-                while True:
-                    try:
-                        choice = int(log.question("Please select a device to remove"))
-                        if 1 <= choice <= len(device_response):
-                            device_id_to_delete = device_response[choice - 1]['id_device']
-                            break
+                                else:
+                                    log.warning("Invalid selection. Please select a number from the list.")
+                            except ValueError:
+                                log.warning("Invalid entry. Please enter a number.")
+
+                        delete_endpoint = f"{host}api/device/default/{device_id_to_delete}"
+
+                        with log.loading("Removing device"):
+                            delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
+
+                        if delete_response and delete_response.status_code == 204:
+                            log.success(f"Device '{device_response[choice - 1]['name']}' removed successfully.")
+                            log.info("Trying registration again.")
+                            continue
+
                         else:
-                            log.warning("Invalid selection. Please select a number from the list.")
-                    except ValueError:
-                        log.warning("Invalid entry. Please enter a number.")
+                            log.error("Device removal failed!")
+                            return None
 
-                delete_endpoint = f"{host}api/device/default/{device_id_to_delete}"
-                with log.loading("Removing device"):
-                    delete_response = request_to_endpoint(method="delete", endpoint=delete_endpoint, auth_token=token)
+                    else:
+                        if error_data is not None:
+                            log.error(f"Unexpected response from server: {error_data}")
+                        else:
+                            log.error("Couldn't get response from server. Please contact administrator.")
+                        log.error("Please contact system administrator.")
+                        return None
 
-                if delete_response and delete_response.status_code == 204:
-                    log.success(f"Device '{device_response[choice - 1]['name']}' removed successfully.")
-                    log.info("Trying registration again.")
-                    continue
-                else:
-                    log.error("Device removal failed!")
-                    return None
-
-            else:
-                if error_data is not None:
-                    log.error(f"Unexpected response from server: {error_data}")
-                else:
-                    log.error("Couldn't get response from server. Please contact administrator.")
-                log.error("Please contact system administrator.")
-                return None
+            except Exception:
+                pass
         else:
             log.error(f"Unexpected error occurred. Error: {register_response.text}")
             return None
@@ -472,6 +486,21 @@ def install(device_type, token, host, workspace):
         data = {
             "name": f"{device_info['device_name']}",
             "device_type": DEVICE_TYPE_LOCAL,
+            "serial": f"{device_info['serial']}",
+            "processor": f"{device_info['processor']}",
+            "cpu": f"{device_info['cpu']}",
+            "gpu": f"{device_info['gpu']}",
+            "os": f"{device_info['os']}",
+            "disk": f"{device_info['disk']}",
+            "memory": f"{device_info['memory']}",
+            "architecture": f"{device_info['architecture']}",
+            "platform": f"{device_info['platform']}"
+        }
+
+    elif device_type == "edge":
+        data = {
+            "name": f"{device_info['device_name']}",
+            "device_type": DEVICE_TYPE_EDGE,
             "serial": f"{device_info['serial']}",
             "processor": f"{device_info['processor']}",
             "cpu": f"{device_info['cpu']}",
@@ -666,6 +695,7 @@ def manage_docker(command, type, app_name=None):
             if ret:
                 log.success("Server network removed successfully.")
             return None
+
         elif type == "app":
             with log.loading("Stopping App"):
                 try:

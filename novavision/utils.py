@@ -144,7 +144,6 @@ def get_serial():
         elif system == "Darwin":  # macOS
             result = subprocess.run(["system_profiler", "SPHardwareDataType"], capture_output=True, text=True,
                                     check=True)
-            serial = ""
             for line in result.stdout.split("\n"):
                 if "Serial Number" in line:
                     serial = line.split(":")[-1].strip()
