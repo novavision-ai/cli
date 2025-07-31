@@ -172,11 +172,9 @@ def get_running_container_compose_file():
         log.error(f"Error while fetching running container: {e}")
         return None
 
-def delete_old_containers(key):
+def delete_old_containers(key, server_folder):
     containers = set()
     docker_compose_files = []
-    server_path = Path.home() / ".novavision" / "Server"
-    server_folder = choose_server_folder(server_path)
 
     for root, dirs, files in os.walk(server_folder):
         if "docker-compose.yml" in files:
@@ -413,35 +411,52 @@ def install(device_type, token, host, workspace):
         return
 
     if os.path.exists(server_path):
-        app_name = None
-        server_folder = choose_server_folder(server_path)
         pattern = re.compile(r'^[A-Za-z0-9]{6}$')
-
-        for item in os.listdir(str(server_folder)):
-            item_path = os.path.join(str(server_folder), item)
-            if os.path.isdir(item_path) and pattern.match(item):
-                app_name = item
-                manage_docker("stop", "app", app_name)
-
-        manage_docker("stop", "server")
-        if app_name is not None:
-            delete_containers = delete_old_containers(key=app_name)
+        server_folders = [item for item in server_path.iterdir() if item.is_dir() and pattern.match(item.name)]
+        for server_folder in server_folders:
+            # Stop server
+            compose_file = server_folder / "docker-compose.yml"
+            if compose_file.exists():
+                manage_docker("stop", "server", select_server=False)
+            # Find apps inside server
+            app_folders = [item for item in server_folder.iterdir() if item.is_dir() and pattern.match(item.name)]
+            for app_folder in app_folders:
+                app_compose_file = app_folder / "docker-compose.yml"
+                if app_compose_file.exists():
+                    manage_docker("stop", "app", app_folder.name)
+                delete_containers = delete_old_containers(key=app_folder.name, server_folder=app_folder)
+                if delete_containers is None:
+                    return None
+            # Also clean up server containers
+            delete_containers = delete_old_containers(key=server_folder.name, server_folder=server_folder)
             if delete_containers is None:
                 return None
 
-        while True:
-            delete = log.question("There is already a server installed on this machine. Previous installation will be removed. All unsaved changes will be deleted. Would you like to continue?(y/n)").strip().lower()
-            if delete == "y":
-                try:
-                    remove_directory(server_path)
-                    break
-                except Exception as e:
-                    log.error(f"Server file deletion failed: {e}")
-            elif delete == "n":
-                log.warning("Aborting.")
-                return
-            else:
-                log.warning("Invalid input. Try again.")
+        # while True:
+        #     delete = log.question("There is already a server installed on this machine. Previous installation will be removed. All unsaved changes will be deleted. Would you like to continue?(y/n)").strip().lower()
+        #     if delete == "y":
+        #         try:
+        #             remove_directory(server_path)
+        #             break
+        #         except Exception as e:
+        #             log.error(f"Server file deletion failed: {e}")
+        #     elif delete == "n":
+        #         log.warning("Aborting.")
+        #         return
+        #     else:
+        #         log.warning("Invalid input. Try again.")
+
+    while True:
+        user_port = log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
+
+        if user_port == "y":
+            port = "7001"
+            break
+        elif user_port == "n":
+            port = log.question("Please enter desired port")
+            break
+        else:
+            log.error("Invalid input.")
 
     if device_type == "cloud":
         response = request_to_endpoint(method="get", endpoint="https://api.ipify.org?format=text")
@@ -456,15 +471,6 @@ def install(device_type, token, host, workspace):
             wan_host = log.question("Enter WAN HOST").strip()
         else:
             log.warning("Invalid input. Using detected WAN HOST...")
-
-        user_port = log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
-
-        if user_port == "y":
-            port = "7001"
-        elif user_port == "n":
-            port = log.question("Please enter desired port")
-        else:
-            log.error("Invalid input.")
 
         data = {
             "name": f"{device_info['device_name']}",
@@ -493,6 +499,7 @@ def install(device_type, token, host, workspace):
             "os": f"{device_info['os']}",
             "disk": f"{device_info['disk']}",
             "memory": f"{device_info['memory']}",
+            "os_api_port": f"{port}",
             "architecture": f"{device_info['architecture']}",
             "platform": f"{device_info['platform']}"
         }
@@ -636,65 +643,94 @@ def install(device_type, token, host, workspace):
         if zip_path.exists():
             os.remove(zip_path)
 
-def manage_docker(command, type, app_name=None):
+def manage_docker(command, type, app_name=None, select_server=True):
     default_path = Path.home() / ".novavision"
     server_path = default_path / "Server"
     if command == "start":
         if type == "server":
-            server_folder = choose_server_folder(server_path)
-            docker_compose_file = server_folder / "docker-compose.yml"
-
-            previous_containers = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True).stdout.strip().split("\n"))
-
-            log.info("Starting server")
-            try:
-                if shutil.which("docker"):
-                    subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
-                elif shutil.which("docker-compose"):
-                    subprocess.run(["docker-compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
-                result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"], capture_output=True,
-                                        text=True)
-            except subprocess.CalledProcessError as e:
-                return log.error(f"Error starting server: {e}")
-
-            current_containers = result.stdout.strip().split("\n")
-            new_containers = []
-            for container in current_containers:
-                parts = container.split(" ", 2)
-                container_id = parts[0]
-                container_name = parts[1]
-                container_ports = parts[2] if len(parts) > 2 else "No ports"
-                if container_id not in previous_containers:
-                    ports = []
-                    for mapping in container_ports.split(", "):
-                        if "->" in mapping:
-                            ports.append(mapping.split("->")[1].split("/")[0].strip())
-                    port_display = ", ".join(ports) if ports else "Not Exposed to Host"
-                    new_containers.append((container_name, port_display))
-
-            if new_containers:
-                log.info("Started containers:")
-                for name, ports in new_containers:
-                    log.info(f"- {name} -> Ports: {ports}")
-
-            else:
-                log.warning("No containers started.")
+            server_folder = choose_server_folder(server_path) if select_server else None
+            if server_folder is None and not select_server:
+                server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+                for folder in server_folders:
+                    docker_compose_file = folder / "docker-compose.yml"
+                    if docker_compose_file.exists():
+                        # Start each server
+                        try:
+                            if shutil.which("docker"):
+                                subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                            elif shutil.which("docker-compose"):
+                                subprocess.run(["docker-compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                        except subprocess.CalledProcessError as e:
+                            log.error(f"Error starting server {folder.name}: {e}")
                 return None
+            else:
+                server_folder = server_folder or choose_server_folder(server_path)
+                docker_compose_file = server_folder / "docker-compose.yml"
+                previous_containers = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True).stdout.strip().split("\n"))
+                log.info("Starting server")
+                try:
+                    if shutil.which("docker"):
+                        subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                    elif shutil.which("docker-compose"):
+                        subprocess.run(["docker-compose", "-f", str(docker_compose_file), "up", "-d"], check=True)
+                    result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"], capture_output=True,
+                                            text=True)
+                except subprocess.CalledProcessError as e:
+                    return log.error(f"Error starting server: {e}")
+
+                current_containers = result.stdout.strip().split("\n")
+                new_containers = []
+                for container in current_containers:
+                    parts = container.split(" ", 2)
+                    container_id = parts[0]
+                    container_name = parts[1]
+                    container_ports = parts[2] if len(parts) > 2 else "No ports"
+                    if container_id not in previous_containers:
+                        ports = []
+                        for mapping in container_ports.split(", "):
+                            if "->" in mapping:
+                                ports.append(mapping.split("->")[1].split("/")[0].strip())
+                        port_display = ", ".join(ports) if ports else "Not Exposed to Host"
+                        new_containers.append((container_name, port_display))
+
+                if new_containers:
+                    log.info("Started containers:")
+                    for name, ports in new_containers:
+                        log.info(f"- {name} -> Ports: {ports}")
+
+                else:
+                    log.warning("No containers started.")
+                    return None
         return None
 
     else:
         if type == "server":
-            server_folder = choose_server_folder(server_path)
-            docker_compose_file = server_folder / "docker-compose.yml"
-            if shutil.which("docker"):
-                subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
-            elif shutil.which("docker-compose"):
-                subprocess.run(["docker-compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
-            log.success("Server stopped.")
-            ret = remove_network()
-            if ret:
-                log.success("Server network removed successfully.")
-            return None
+            if select_server:
+                server_folder = choose_server_folder(server_path)
+                docker_compose_file = server_folder / "docker-compose.yml"
+                if shutil.which("docker"):
+                    subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
+                elif shutil.which("docker-compose"):
+                    subprocess.run(["docker-compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
+                log.success("Server stopped.")
+                ret = remove_network()
+                if ret:
+                    log.success("Server network removed successfully.")
+                return None
+            else:
+                server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+                for folder in server_folders:
+                    docker_compose_file = folder / "docker-compose.yml"
+                    if docker_compose_file.exists():
+                        if shutil.which("docker"):
+                            subprocess.run(["docker", "compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
+                        elif shutil.which("docker-compose"):
+                            subprocess.run(["docker-compose", "-f", str(docker_compose_file), "down", "--volumes"], check=True)
+                        log.success(f"Server {folder.name} stopped.")
+                        ret = remove_network()
+                        if ret:
+                            log.success(f"Server {folder.name} network removed successfully.")
+                return None
 
         elif type == "app":
             with log.loading("Stopping App"):
