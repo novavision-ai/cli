@@ -1,12 +1,10 @@
 import os
 import re
-import stat
 import yaml
 import shutil
 import zipfile
 import argparse
 import requests
-import platform
 import subprocess
 
 from pathlib import Path
@@ -63,23 +61,6 @@ def create_agent():
     agent_dir.mkdir(parents=True, exist_ok=True)
     return agent_dir
 
-def remove_readonly(func, path):
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-def remove_directory(path):
-    try:
-        if platform.system() == "Windows":
-            shutil.rmtree(path, onerror=remove_readonly)
-        else:
-            subprocess.run(
-                ["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", path],
-                check=True
-            )
-            subprocess.run(["rm", "-rf", path], check=True)
-    except Exception as e:
-        log.error(f"Failed to remove {path}: {e}")
-
 def remove_network():
     try:
         result = subprocess.run(
@@ -130,47 +111,23 @@ def choose_server_folder(server_path):
         log.error("No server folders found!")
         return None
 
-    if len(server_folders) == 1 or len(visible_folders) == 1:
-        return server_folders[0]
+    if len(visible_folders) == 1:
+        return visible_folders[0]
+    elif len(visible_folders) > 1:
+        log.info("Multiple server folders found. Please select one")
+        for idx, folder in enumerate(visible_folders):
+            log.info(f"{idx + 1}. {folder.name}")
+        while True:
+            try:
+                choice = int(log.question("Enter the number of the server you want to select"))
+                if 1 <= choice <= len(visible_folders):
+                    return visible_folders[choice - 1]
+                else:
+                    log.warning("Invalid selection. Please enter a valid number.")
+            except ValueError:
+                log.warning("Invalid input. Please enter a number.")
 
-    log.info("Multiple server folders found. Please select one:")
-
-    for idx, folder in enumerate(visible_folders):
-        log.info(f"{idx + 1}. {folder.name}")
-
-    while True:
-        try:
-            choice = int(log.question("Enter the number of the server you want."))
-            if 1 <= choice <= len(visible_folders):
-                return server_folders[choice - 1]
-            else:
-                log.warning("Invalid selection. Please enter a valid number.")
-        except ValueError:
-            log.warning("Invalid input. Please enter a number.")
-
-def get_running_container_compose_file():
-    try:
-        result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True
-        )
-        running_containers = result.stdout.strip().split("\n")
-
-        if not running_containers:
-            log.warning("No running containers found.")
-            return None
-
-        server_path = Path.home() / ".novavision" / "Server"
-        for folder in server_path.iterdir():
-            if folder.is_dir():
-                compose_file = folder / "docker-compose.yml"
-                if compose_file.exists():
-                    for container_name in running_containers:
-                        if container_name.startswith(folder.name):
-                            return compose_file
-        return None
-    except Exception as e:
-        log.error(f"Error while fetching running container: {e}")
-        return None
+    return server_folders[0]
 
 def delete_old_containers(key, server_folder):
     containers = set()
@@ -195,8 +152,6 @@ def delete_old_containers(key, server_folder):
         for i in range(len(containers)):
             if key in containers[i][0]:
                 subprocess.run(["docker", "container", "rm", "-f", f"{containers[i][0]}"], check=True, stdout=subprocess.DEVNULL)
-
-        log.success("Successfully removed old containers.")
         return True
 
     except Exception as e:
@@ -347,6 +302,26 @@ def install(device_type, token, host, workspace):
     formatted_host = format_host(host)
     os.chdir(os.path.expanduser("~"))
     device_info = get_system_info()
+
+    if isinstance(device_info, list):
+        if len(device_info['gpu']) > 1:
+            log.info("Multiple GPUs detected. Please select one GPU.")
+
+            for idx, gpu in enumerate(device_info['gpu']):
+                log.info(f"{idx + 1}. {gpu}")
+            while True:
+                try:
+                    choice = int(log.question("Please select a GPU to continue"))
+                    if 1 <= choice <= len(device_info['gpu']):
+                        device_info['gpu'] = device_info['gpu'][choice - 1]
+                        break
+                    else:
+                        log.warning("Invalid selection. Please select a number from the list.")
+                except ValueError:
+                    log.warning("Invalid entry. Please enter a number.")
+        else:
+            device_info['gpu'] = device_info['gpu'][0] if device_info['gpu'] else "No GPU Detected"
+
     server_path = Path.home() / ".novavision" / "Server"
 
     try:
@@ -414,11 +389,6 @@ def install(device_type, token, host, workspace):
         pattern = re.compile(r'^[A-Za-z0-9]{6}$')
         server_folders = [item for item in server_path.iterdir() if item.is_dir() and pattern.match(item.name)]
         for server_folder in server_folders:
-            # Stop server
-            compose_file = server_folder / "docker-compose.yml"
-            if compose_file.exists():
-                manage_docker("stop", "server", select_server=False)
-            # Find apps inside server
             app_folders = [item for item in server_folder.iterdir() if item.is_dir() and pattern.match(item.name)]
             for app_folder in app_folders:
                 app_compose_file = app_folder / "docker-compose.yml"
@@ -427,24 +397,15 @@ def install(device_type, token, host, workspace):
                 delete_containers = delete_old_containers(key=app_folder.name, server_folder=app_folder)
                 if delete_containers is None:
                     return None
-            # Also clean up server containers
+
+        manage_docker("stop", "server", select_server=False)
+
+        for server_folder in server_folders:
             delete_containers = delete_old_containers(key=server_folder.name, server_folder=server_folder)
             if delete_containers is None:
                 return None
-
-        # while True:
-        #     delete = log.question("There is already a server installed on this machine. Previous installation will be removed. All unsaved changes will be deleted. Would you like to continue?(y/n)").strip().lower()
-        #     if delete == "y":
-        #         try:
-        #             remove_directory(server_path)
-        #             break
-        #         except Exception as e:
-        #             log.error(f"Server file deletion failed: {e}")
-        #     elif delete == "n":
-        #         log.warning("Aborting.")
-        #         return
-        #     else:
-        #         log.warning("Invalid input. Try again.")
+        if delete_containers:
+            log.success("Successfully removed old containers.")
 
     while True:
         user_port = log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
