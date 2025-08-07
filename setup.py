@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name='novavision-cli',
-    version='0.1.42',
+    version='0.0.1',
     packages=find_packages(),
     include_package_data=True,
     install_requires=["requests==2.32.3",
@@ -19,8 +19,8 @@ setup(
     entry_points={
         'console_scripts': ['novavision=novavision.cli:main'],
     },
-    author="Kaan",
-    author_email="kaanyzc2002@gmail.com",
+    author="İlhan Kaan Yazıcıoğlu",
+    author_email="ilhan.kaan.yazicioglu@diginova.com.tr",
     description="NovaVision CLI for handling device and servers.",
     long_description=long_description,
     long_description_content_type="text/markdown",

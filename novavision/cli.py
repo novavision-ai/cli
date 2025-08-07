@@ -303,10 +303,9 @@ def install(device_type, token, host, workspace):
     os.chdir(os.path.expanduser("~"))
     device_info = get_system_info()
 
-    if isinstance(device_info, list):
+    if isinstance(device_info['gpu'], list):
         if len(device_info['gpu']) > 1:
             log.info("Multiple GPUs detected. Please select one GPU.")
-
             for idx, gpu in enumerate(device_info['gpu']):
                 log.info(f"{idx + 1}. {gpu}")
             while True:
