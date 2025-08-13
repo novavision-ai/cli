@@ -11,7 +11,7 @@ NovaVision simplifies the process of setting up and managing servers, allowing y
 Install NovaVision CLI using pip:
 
 ```bash
-pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple --no-cache-dir novavision-cli
+pip install novavision-cli
 ```
 
 ---
