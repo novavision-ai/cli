@@ -8,10 +8,18 @@ NovaVision simplifies the process of setting up and managing servers, allowing y
 
 ## Installation
 
-Install NovaVision CLI using pip:
+Install NovaVision CLI using pipx:
 
 ```bash
-pip install novavision-cli
+# Install pipx if not already installed
+python -m pip install --user pipx
+python -m pipx ensurepath
+
+# Install NovaVision CLI with pipx
+pipx install novavision-cli
+
+# Verify Installation
+novavision --help
 ```
 
 ---
