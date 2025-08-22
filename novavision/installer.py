@@ -43,7 +43,6 @@ class Installer:
             else:
                 device_info['gpu'] = device_info['gpu'][0] if device_info['gpu'] else "No GPU Detected"
 
-
     def format_host(self, host):
         host = host.strip()
         if not host.startswith("https://"):
@@ -75,7 +74,7 @@ class Installer:
             return e
 
     def install(self, device_type, token, host, workspace):
-        formatted_host = self.format_host(host)
+        host = self.format_host(host)
         os.chdir(os.path.expanduser("~"))
         device_info = get_system_info()
 
@@ -86,7 +85,7 @@ class Installer:
         self._select_gpu(device_info)
 
         # Workspace seçimi
-        workspace_id = self._select_workspace(formatted_host, token, workspace)
+        workspace_id = self._select_workspace(host, token, workspace)
         if not workspace_id:
             return
 
@@ -102,14 +101,15 @@ class Installer:
             return
 
         # Device kaydı
-        register_response = self._register_device(device_data, token, formatted_host, device_info)
+        register_response = self._register_device(device_data, token, host, device_info)
         if not register_response:
             return
 
         # Server kurulumu
-        self._setup_server(register_response, formatted_host, token)
+        self._setup_server(register_response, host, token)
 
     def _select_workspace(self, host, token, workspace):
+        host = self.format_host(host)
         workspace_endpoint = f"{host}api/workspace/user?expand=workspace"
         workspace_list_response = self.request_to_endpoint("get", endpoint=workspace_endpoint, auth_token=token)
 
@@ -210,6 +210,7 @@ class Installer:
         return base_data
 
     def _register_device(self, data, token, host, device_info):
+        host = self.format_host(host)
         register_endpoint = f"{host}api/device/default?expand=user"
         device_endpoint = f"{host}api/device/default"
         
@@ -234,7 +235,7 @@ class Installer:
                 self.log.warning("In order to continue device must be deleted.")
 
                 while True:
-                    remove = self.log.question(f"Would you like to delete {device['name']}? (y/n)")
+                    remove = self.log.question(f"Would you like to delete {device['name']}? (y/n)").lower()
                     if remove == "y":
                         if not self._delete_device(device['id_device'], host, token):
                             return None
@@ -267,6 +268,7 @@ class Installer:
                 return None
 
     def _delete_device(self, device_id, host, token):
+        host = self.format_host(host)
         delete_endpoint = f"{host}api/device/default/{device_id}"
         with self.log.loading("Removing old device"):
             delete_response = self.request_to_endpoint("delete", endpoint=delete_endpoint, auth_token=token)
@@ -279,9 +281,18 @@ class Installer:
             return False
 
     def _setup_server(self, register_response, host, token):
+        host = self.format_host(host)
         try:
             access_token = register_response["user"]["access_token"]
             id_device = register_response["id_device"]
+
+            id_deploy_endpoint = f"{host}api/deployment?filter[id_device][eq]={id_device}&sort=id_deploy"
+            id_deploy_response = self.request_to_endpoint(
+                "get",
+                endpoint=id_deploy_endpoint,
+                auth_token=access_token
+            ).json()
+            id_deploy = id_deploy_response[0]["id_deploy"]
             
             # Get server package
             server_endpoint = f"{host}api/device/default/{id_device}"
@@ -301,9 +312,31 @@ class Installer:
                 self.log.error("Failed to download server package")
                 return
 
+            # Extract and setup server
             self._extract_and_setup_server(agent_response.content)
-        except:
-            self.log.error("An error occurred while setting up the server.")
+
+            if not self._extract_and_setup_server(agent_response.content):
+                return
+
+            # Send deployment status
+            deploy_data = {"is_deploy": 1}
+
+            # Agent Deploy Status Update
+            self.send_deploy_status(
+                data=deploy_data,
+                access_token=access_token,
+                endpoint=f"{host}api/deployment/default/{id_deploy}")
+
+            # Server Deploy Status Update
+            self.send_deploy_status(
+                data=deploy_data,
+                access_token=access_token,
+                endpoint=server_endpoint
+            )
+
+
+        except Exception as e:
+            self.log.error(f"An error occurred while setting up the server: {e}")
             return
 
     def _extract_and_setup_server(self, content):
@@ -368,3 +401,24 @@ class Installer:
                 os.remove(zip_path)
 
         return False
+
+    def send_deploy_status(self, data, access_token, endpoint):
+        try:
+            with self.log.loading("Sending deploy status"):
+                deploy_response = self.request_to_endpoint(
+                    "put",
+                    endpoint=endpoint,
+                    data=data,
+                    auth_token=access_token
+                )
+            if deploy_response:
+                if deploy_response.status_code == 200:
+                    self.log.success("Deployment status updated successfully!")
+                else:
+                    self.log.error(f"Failed to update deployment status: {deploy_response.text}")
+            else:
+                self.log.error("Deployment status update request failed.")
+                return
+        except Exception as e:
+            self.log.error(f"Error sending deployment status: {e}")
+
