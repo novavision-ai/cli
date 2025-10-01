@@ -1,4 +1,6 @@
 import argparse
+from pathlib import Path
+from datetime import datetime
 from novavision.logger import ConsoleLogger
 from novavision.installer import Installer
 from novavision.docker_manager import DockerManager
@@ -7,9 +9,8 @@ logger = ConsoleLogger()
 
 class NovaVisionCLI:
     def __init__(self):
-
-        self.docker = DockerManager()
-        self.installer = Installer()
+        self.docker = DockerManager(logger=logger)
+        self.installer = None  # will be created per install with file logger
 
     def create_parser(self):
         parser = argparse.ArgumentParser(description="NovaVision CLI Tool")
@@ -23,7 +24,9 @@ class NovaVisionCLI:
         return parser
 
     def _add_install_parser(self, subparsers):
-        install_parser = subparsers.add_parser("install", help="Creates device and installs server")
+        install_parser = subparsers.add_parser(
+            "install",
+            help="Creates device and installs server")
         install_parser.add_argument(
             "device_type",
             choices=["edge", "local", "cloud"],
@@ -45,7 +48,9 @@ class NovaVisionCLI:
         )
 
     def _add_start_parser(self, subparsers):
-        start_parser = subparsers.add_parser("start", help="Starts server | app")
+        start_parser = subparsers.add_parser(
+            "start",
+            help="Starts server | app")
         start_parser.add_argument(
             "type",
             choices=["server", "app"],
@@ -58,7 +63,9 @@ class NovaVisionCLI:
         )
 
     def _add_stop_parser(self, subparsers):
-        stop_parser = subparsers.add_parser("stop", help="Stops server | app")
+        stop_parser = subparsers.add_parser(
+            "stop",
+            help="Stops server | app")
         stop_parser.add_argument(
             "type",
             choices=["server", "app"],
@@ -71,6 +78,12 @@ class NovaVisionCLI:
         )
 
     def handle_install(self, args):
+        log_dir = Path.home() / ".novavision"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"install-{datetime.now().strftime('%Y-%m-%d_%H-%M')}.log"
+        install_logger = ConsoleLogger(log_file_path=str(log_file))
+        install_logger.info(f"Logging installation to {log_file}")
+        self.installer = Installer(logger=install_logger)
         self.installer.install(
             device_type=args.device_type,
             token=args.token,
