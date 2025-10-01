@@ -5,8 +5,8 @@ from novavision.logger import ConsoleLogger
 import yaml
 
 class DockerManager:
-    def __init__(self):
-        self.log = ConsoleLogger()
+    def __init__(self, logger):
+        self.log = logger or ConsoleLogger()
 
     def choose_server_folder(self, server_path):
         server_folders = [item for item in server_path.iterdir() if item.is_dir()]
@@ -88,7 +88,7 @@ class DockerManager:
                         docker_compose_file = folder / "docker-compose.yml"
                         if docker_compose_file.exists():
                             try:
-                                self._run_docker_compose(docker_compose_file, "up", "-d")
+                                self.run_docker_compose(docker_compose_file, "up", "-d")
                             except subprocess.CalledProcessError as e:
                                 self.log.error(f"Error starting server {folder.name}: {e}")
                 else:
@@ -102,7 +102,7 @@ class DockerManager:
             elif type == "app":
                 self._stop_app(app_name)
 
-    def _run_docker_compose(self, compose_file, *args):
+    def run_docker_compose(self, compose_file, *args):
         if shutil.which("docker"):
             subprocess.run(["docker", "compose", "-f", str(compose_file)] + list(args), check=True)
         elif shutil.which("docker-compose"):
@@ -113,7 +113,7 @@ class DockerManager:
                                               capture_output=True, text=True).stdout.strip().split("\n"))
         self.log.info("Starting server")
         try:
-            self._run_docker_compose(docker_compose_file, "up", "-d")
+            self.run_docker_compose(docker_compose_file, "up", "-d")
             result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
                                  capture_output=True, text=True)
             self._display_new_containers(result.stdout, previous_containers)
@@ -124,7 +124,7 @@ class DockerManager:
         if select_server:
             server_folder = self.choose_server_folder(server_path)
             docker_compose_file = server_folder / "docker-compose.yml"
-            self._run_docker_compose(docker_compose_file, "down", "--volumes")
+            self.run_docker_compose(docker_compose_file, "down", "--volumes")
             self.log.success("Server stopped.")
             if self.remove_network():
                 self.log.success("Server network removed successfully.")
@@ -133,7 +133,7 @@ class DockerManager:
             for folder in server_folders:
                 docker_compose_file = folder / "docker-compose.yml"
                 if docker_compose_file.exists():
-                    self._run_docker_compose(docker_compose_file, "down", "--volumes")
+                    self.run_docker_compose(docker_compose_file, "down", "--volumes")
                     self.log.success(f"Server {folder.name} stopped.")
                     if self.remove_network():
                         self.log.success(f"Server {folder.name} network removed successfully.")
