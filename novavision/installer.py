@@ -24,6 +24,7 @@ class Installer:
         return agent_dir
 
     def _select_gpu(self, device_info):
+        # Birden fazla GPU varsa kullanıcıdan seçim yapmasını iste
         if isinstance(device_info['gpu'], list):
             if len(device_info['gpu']) > 1:
                 self.log.info("Multiple GPUs detected. Please select one GPU.")
@@ -43,6 +44,7 @@ class Installer:
                 device_info['gpu'] = device_info['gpu'][0] if device_info['gpu'] else "No GPU Detected"
 
     def format_host(self, host):
+        # CLI'da girilen host parametresinin doğru formatta olup olmadığını kontrol et
         host = host.strip()
         if not host.startswith("https://"):
             if host.startswith("http://"):
@@ -53,6 +55,7 @@ class Installer:
         return host
 
     def request_to_endpoint(self, method, endpoint, data=None, auth_token=None):
+        # Genel API istek fonksiyonu
         headers = {'Authorization': f'Bearer {auth_token}'} if auth_token else {}
         response = None
         try:
@@ -67,26 +70,37 @@ class Installer:
             else:
                 self.log.error(f"Invalid HTTP method: {method}")
                 return None
-
             return response
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             return e
 
     def install(self, device_type, token, host, workspace):
+        # Host parametresini formatlama
         host = self.format_host(host)
-        os.chdir(os.path.expanduser("~"))
-        device_info = get_system_info()
 
-        if not device_info:
-            self.log.error("Failed to retrieve system information.")
+        # Ana dizine geçiş
+        os.chdir(os.path.expanduser("~"))
+
+        # Docker durum sorgulama ve eski containerları durdurup silme
+        self.docker._check_docker_available()
+        self.docker._cleanup_previous_docker_installations()
+
+        # Sistem bilgilerini alma
+        device_info = get_system_info()
+        if "error" in device_info:
+            self.log.error(f"Error getting system info: {device_info['error']}")
             return
 
+        # Birden fazla GPU varsa istenilen GPU seçimi
         self._select_gpu(device_info)
 
         # Workspace seçimi
         workspace_user_id = self._get_workspace_id(host, token, workspace)
 
-        self._set_workspace(host, token, workspace_user_id)
+        if workspace_user_id:
+            self._set_workspace(host, token, workspace_user_id)
+        else:
+            return
 
         # Port seçimi
         port = self._select_port()
@@ -101,22 +115,28 @@ class Installer:
 
         # Device kaydı
         register_response = self._register_device(device_data, token, host, device_info)
-        if not register_response:
+        if register_response is None:
             return
 
         # Server kurulumu
         self._setup_server(register_response, host)
 
     def _get_workspace_id(self, host, token, workspace):
+        # Host ve endpoint ayarlama
         host = self.format_host(host)
         get_workspace_endpoint = f"{host}api/workspace/user?expand=workspace"
+
+        # Kullanıcıya ait workspace listesini alma
         workspace_list_response = self.request_to_endpoint(
             "get",
             endpoint=get_workspace_endpoint,
             auth_token=token
         )
 
-        if not workspace_list_response:
+        if isinstance(workspace_list_response, requests.exceptions.ConnectionError):
+            self.log.error("Failed to connect to the server. Please check the host URL and network connection.")
+            return None
+        if workspace_list_response is None:
             self.log.error("Failed to get workspace list from server")
             return None
 
@@ -134,7 +154,9 @@ class Installer:
             self.log.error(f"Failed to parse workspace response: {e}")
             return None
 
+        # Kullanıcı CLI'da eğer workspace belirtmemişse seçim yapmasını sağla
         if not workspace:
+            workspace_user_id = None
             if not workspace_list:
                 self.log.error("There is no workspace available.")
                 return None
@@ -158,8 +180,7 @@ class Installer:
                 try:
                     choice = int(self.log.question("Please select a workspace to continue"))
                     if 1 <= choice <= len(workspace_list):
-                        workspace_user_id = workspace_list[choice - 1]['id_workspace_user']
-                        break
+                        return workspace_list[choice - 1]['id_workspace_user']
                     else:
                         self.log.warning("Invalid selection. Please select a number from the list.")
                 except ValueError:
@@ -174,9 +195,7 @@ class Installer:
             if not workspace_user_id:
                 self.log.error(f"Workspace '{workspace}' does not have a valid user ID")
                 return None
-
-        return workspace_user_id
-
+            return workspace_user_id
 
     def _set_workspace(self, host, token, workspace_user_id):
         if workspace_user_id is None:
@@ -193,12 +212,15 @@ class Installer:
             auth_token=token
         )
 
-        if set_workspace_response.status_code == 200:
-            self.log.success("Workspace set successfully!")
-        else:
-            self.log.error(f"Workspace set failed! Error: {set_workspace_response.text}")
+        try:
+            if set_workspace_response.status_code == 200:
+                self.log.success("Workspace set successfully!")
+            else:
+                self.log.error(f"Workspace set failed! Error: {set_workspace_response.text}")
+                return
+        except Exception as e:
+            self.log.error(f"Error occurred while setting workspace: {e}")
             return
-
 
     def _select_port(self):
         while True:
@@ -206,7 +228,16 @@ class Installer:
             if user_port == "y":
                 return "7001"
             elif user_port == "n":
-                return self.log.question("Please enter desired port")
+                while True:
+                    entered = self.log.question("Please enter desired port").strip()
+                    if entered.isdigit():
+                        port_int = int(entered)
+                        if 1 <= port_int <= 65535:
+                            return str(port_int)
+                        else:
+                            self.log.warning("Port must be between 1 and 65535.")
+                    else:
+                        self.log.warning("Port must be a number.")
             else:
                 self.log.error("Invalid input.")
 
@@ -231,12 +262,12 @@ class Installer:
                 wan_host = response.text
                 self.log.info(f"Detected WAN HOST: {wan_host}")
                 user_wan_ip = self.log.question("Would you like to use detected WAN HOST? (y/n)").strip().lower()
-                
+
                 if user_wan_ip == "n":
                     wan_host = self.log.question("Enter WAN HOST").strip()
                 elif user_wan_ip != "y":
                     self.log.warning("Invalid input. Using detected WAN HOST...")
-                
+
                 base_data.update({
                     "device_type": self.DEVICE_TYPE_CLOUD,
                     "wan_host": wan_host
@@ -247,10 +278,10 @@ class Installer:
 
         elif device_type == "edge":
             base_data["device_type"] = self.DEVICE_TYPE_EDGE
-        
+
         elif device_type == "local":
             base_data["device_type"] = self.DEVICE_TYPE_LOCAL
-        
+
         else:
             self.log.error("Wrong device type selected!")
             return None
@@ -261,7 +292,7 @@ class Installer:
         host = self.format_host(host)
         register_endpoint = f"{host}api/device/default?expand=user"
         device_endpoint = f"{host}api/device/default"
-        
+
         while True:
             device_response = self.request_to_endpoint(
                 "get",
@@ -278,32 +309,32 @@ class Installer:
                 self.log.error(f"Invalid response format received while fetching devices: {device_response.text}")
                 return None
 
-            device_serial = device_info['serial']
-            matching_devices = [d for d in device_response if d.get("serial") == device_serial]
-
-            if matching_devices:
-                device = matching_devices[0]
-                self.log.warning(f"Device named {device['name']} has same serial number as this machine.")
-                self.log.warning("In order to continue device must be deleted.")
-
-                while True:
-                    remove = self.log.question(f"Would you like to delete {device['name']}? (y/n)").lower()
-                    if remove == "y":
-                        if not self._delete_device(device['id_device'], host, token):
-                            return None
-                        break
-                    elif remove == "n":
-                        self.log.warning("Aborting.")
-                        return None
-                    else:
-                        self.log.warning("Invalid input. Try again.")
-            else:
-                self.log.info("No matching serial found for device. Continuing.")
+            # device_serial = device_info['serial']
+            # matching_devices = [d for d in device_response if d.get("serial") == device_serial]
+            #
+            # if matching_devices:
+            #     device = matching_devices[0]
+            #     self.log.warning(f"Device named {device['name']} has same serial number as this machine.")
+            #     self.log.warning("In order to continue device must be deleted.")
+            #
+            #     while True:
+            #         remove = self.log.question(f"Would you like to delete {device['name']}? (y/n)").lower()
+            #         if remove == "y":
+            #             if not self._delete_device(device['id_device'], host, token):
+            #                 return None
+            #             break
+            #         elif remove == "n":
+            #             self.log.warning("Aborting.")
+            #             return None
+            #         else:
+            #             self.log.warning("Invalid input. Try again.")
+            # else:
+            #     self.log.info("No matching serial found for device. Continuing.")
 
             with self.log.loading("Registering device"):
                 register_response = self.request_to_endpoint("post", endpoint=register_endpoint, data=data, auth_token=token)
 
-            if not register_response:
+            if register_response is None:
                 self.log.error("Failed to register device")
                 return None
 
@@ -312,9 +343,64 @@ class Installer:
                 if register_response.status_code in [200, 201]:
                     self.log.success("Device registered successfully!")
                     return register_json
+                elif register_response.status_code in [400, 403]:
+                    error_code = register_json.get("code", None)
+                    error = register_json.get("error", None)
+
+                    if error is not None:
+                        if isinstance(error, dict):
+                            for value in error.values():
+                                self.log.error(f"Device registration failed: {str(value[0])}")
+                        else:
+                            self.log.error(f"Device registration failed: {error}")
+                        return None
+
+                    try:
+                        if error_code is not None:
+                            error_data = register_json.get("message", None)
+                            if error_code == 0:
+                                if not isinstance(error_data, dict):
+                                    self.log.error("The object 'error' cannot be found or is not in dict format.")
+                                    self.log.error(f"Error Data: {error_data}")
+                                    return None
+
+                                error_message = register_json.get("message", "Unknown error occurred.")
+                                self.log.error(f"Device registration failed: {error_message}")
+                                return None
+
+                            elif error_code == 1:
+                                self.log.warning("User exceeds the maximum limit of device! Device removal is needed.")
+
+                                self.log.info("Current devices:")
+                                for idx, device in enumerate(device_response):
+                                    device_type = {1: "cloud", 2: "edge"}.get(device["device_type"], "local")
+                                    self.log.info(f"{idx + 1}. {device['name']} (Device type: {device_type})")
+
+                                while True:
+                                    try:
+                                        choice = int(self.log.question("Please select a device to remove"))
+                                        if 1 <= choice <= len(device_response):
+                                            device_id_to_delete = device_response[choice - 1]['id_device']
+                                            break
+                                        else:
+                                            self.log.warning("Invalid selection. Please select a number from the list.")
+                                    except ValueError:
+                                        self.log.warning("Invalid entry. Please enter a number.")
+
+                                self._delete_device(device_id_to_delete, host, token)
+
+                            else:
+                                if error_data is not None:
+                                    self.log.error(f"Unexpected response from server: {error_data}")
+                                else:
+                                    self.log.error("Couldn't get response from server. Please contact administrator.")
+                                self.log.error("Please contact system administrator.")
+                                return None
+                    except Exception as e:
+                        self.log.error(f"Error: {e}")
+
                 else:
-                    self.log.error(f"Device registration failed: {register_json}")
-                    return None
+                    self.log.error(f"Unexpected error occurred during registration. Error:{register_response.text}")
             except Exception as e:
                 self.log.error(f"Error parsing registration response: {e}")
                 return None
@@ -339,7 +425,6 @@ class Installer:
     def _setup_server(self, register_response, host):
         host = self.format_host(host)
         try:
-            # Safe dictionary access with validation
             if not register_response:
                 self.log.error("Register response is empty or None")
                 return
@@ -390,7 +475,7 @@ class Installer:
                 endpoint=server_endpoint,
                 auth_token=access_token
             )
-            
+
             if not server_response or server_response.status_code != 200:
                 self.log.error(f"Failed to get server package: {server_response.text if server_response else 'No response'}")
                 return
@@ -412,14 +497,12 @@ class Installer:
                 endpoint=agent_endpoint,
                 auth_token=access_token
             )
-            
+
             if not agent_response:
                 self.log.error("Failed to download server package")
                 return
 
             # Extract and setup server
-            self._extract_and_setup_server(agent_response.content)
-
             if not self._extract_and_setup_server(agent_response.content):
                 return
 
@@ -438,7 +521,6 @@ class Installer:
                 access_token=access_token,
                 endpoint=server_endpoint
             )
-
 
         except Exception as e:
             self.log.error(f"An error occurred while setting up the server: {e}")
