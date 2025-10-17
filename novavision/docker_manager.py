@@ -1,8 +1,11 @@
+import os
+import re
+import yaml
 import shutil
 import subprocess
+
 from pathlib import Path
 from novavision.logger import ConsoleLogger
-import yaml
 
 class DockerManager:
     def __init__(self, logger):
@@ -120,7 +123,7 @@ class DockerManager:
         except subprocess.CalledProcessError as e:
             self.log.error(f"Error starting server: {e}")
 
-    def _stop_server(self, server_path, select_server):
+    def _stop_server(self, server_path, select_server=True):
         if select_server:
             server_folder = self.choose_server_folder(server_path)
             docker_compose_file = server_folder / "docker-compose.yml"
@@ -178,3 +181,71 @@ class DockerManager:
                 self.log.info(f"- {name} -> Ports: {ports}")
         else:
             self.log.warning("No containers started.")
+
+    def _check_docker_available(self):
+        try:
+            subprocess.run(
+                ["docker", "info"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return True
+        except subprocess.CalledProcessError:
+            self.log.error("Docker is not available or not running. Please activate docker first.")
+            return None
+        except FileNotFoundError:
+            self.log.error("Docker is not installed. Please install docker first.")
+            return None
+
+    def _delete_old_containers(self, key):
+        server_folder = Path.home() / ".novavision" / "Server" / key
+
+        if not server_folder.is_dir():
+            self.log.info(f"No server folder for key={key}, skipping.")
+            return True
+
+        try:
+            # Tüm compose dosyalarını bul ve ilgili containerları listele
+            containers = set()
+            for compose_file in server_folder.rglob("docker-compose.yml"):
+                build_info = self.get_docker_build_info(compose_file)
+                if build_info:
+                    for image_name in build_info:
+                        result = subprocess.run(
+                            ["docker", "ps", "-a", "--filter", f"ancestor={image_name}", "--format", "{{.Names}}"],
+                            capture_output=True,
+                            text=True,
+                            check=True
+                        )
+                        containers.update(name for name in result.stdout.strip().splitlines() if name and key in name)
+
+            # Containerları sil
+            for container_name in containers:
+                subprocess.run(["docker", "rm", "-f", container_name],
+                               check=True,
+                               stdout=subprocess.DEVNULL
+                               )
+                self.log.success(f"Container {container_name} removed.")
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to remove old containers: {e}")
+            return None
+
+    def _cleanup_previous_docker_installations(self):
+        server_path = Path.home() / ".novavision" / "Server"
+        self._stop_server(server_path, select_server=False)
+
+        if os.path.exists(server_path):
+            try:
+                pattern = re.compile(r'^[A-Za-z0-9]{6}$')
+                for server_name in os.listdir(server_path):
+                    entry = server_path / server_name
+                    if entry.is_dir() and pattern.match(server_name):
+                        self._delete_old_containers(server_name)
+            except Exception as e:
+                self.log.error(f"Error during docker cleanup: {e}")
+                return None
+        else:
+            self.log.error("No server folder found.")
+            return None
