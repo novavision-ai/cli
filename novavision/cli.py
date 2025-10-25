@@ -38,7 +38,7 @@ class NovaVisionCLI:
         )
         install_parser.add_argument(
             "--host",
-            default="https://alfa.suite.novavision.ai",
+            default="https://suite.novavision.ai",
             help="Host Url"
         )
         install_parser.add_argument(
