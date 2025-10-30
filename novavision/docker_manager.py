@@ -234,9 +234,9 @@ class DockerManager:
 
     def _cleanup_previous_docker_installations(self):
         server_path = Path.home() / ".novavision" / "Server"
-        self._stop_server(server_path, select_server=False)
-
         if os.path.exists(server_path):
+            self._stop_server(server_path, select_server=False)
+
             try:
                 pattern = re.compile(r'^[A-Za-z0-9]{6}$')
                 for server_name in os.listdir(server_path):
@@ -246,6 +246,6 @@ class DockerManager:
             except Exception as e:
                 self.log.error(f"Error during docker cleanup: {e}")
                 return None
+
         else:
-            self.log.error("No server folder found.")
-            return None
+            self.log.warning("No server folder found.")
