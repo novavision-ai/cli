@@ -1,8 +1,9 @@
-from rich.console import Console
-from rich.prompt import Prompt
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from datetime import datetime
 from pathlib import Path
+from typing import Optional
+from datetime import datetime
+from rich.prompt import Prompt
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 class ConsoleLogger:
     ICONS = {
@@ -23,7 +24,7 @@ class ConsoleLogger:
         'process': 'magenta'
     }
 
-    def __init__(self, log_file_path: str | None = None, append: bool = False):
+    def __init__(self, log_file_path: Optional[str] = None, append: bool = False):
         self.console = Console()
         self.log_file_path = log_file_path
         self._fh = None
@@ -34,7 +35,6 @@ class ConsoleLogger:
                 mode = 'a' if append else 'w'
                 self._fh = open(path_obj, mode, encoding='utf-8')
             except Exception:
-                # Fallback: disable file logging silently if cannot open
                 self._fh = None
 
     def _timestamp(self):
@@ -51,8 +51,11 @@ class ConsoleLogger:
 
     def _write_file(self, level, message):
         if self._fh:
-            self._fh.write(self._plain_message(level, message) + "\n")
-            self._fh.flush()
+            try:
+                self._fh.write(self._plain_message(level, message) + "\n")
+                self._fh.flush()
+            except Exception:
+                pass
 
     def info(self, message):
         self.console.print(self._format_message('info', message))
