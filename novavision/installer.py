@@ -13,7 +13,7 @@ class Installer:
     DEVICE_TYPE_EDGE = 2
     DEVICE_TYPE_LOCAL = 3
 
-    def __init__(self, logger: ConsoleLogger | None = None):
+    def __init__(self, logger: ConsoleLogger):
         self.log = logger if logger else ConsoleLogger()
         self.docker = DockerManager(logger=self.log)
         self.agent_dir = self._create_agent()
