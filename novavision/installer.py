@@ -1,8 +1,10 @@
+import json
 import os
 import zipfile
 import requests
 import subprocess
 
+from datetime import datetime
 from pathlib import Path
 from novavision.logger import ConsoleLogger
 from novavision.utils import get_system_info
@@ -22,6 +24,49 @@ class Installer:
         agent_dir = Path.home() / ".novavision"
         agent_dir.mkdir(parents=True, exist_ok=True)
         return agent_dir
+
+    def _metadata_path(self):
+        return self.agent_dir / "servers.json"
+
+    def _load_server_metadata(self):
+        metadata_path = self._metadata_path()
+        if not metadata_path.exists():
+            return {}
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            self.log.warning(f"Could not read server metadata: {e}")
+            return {}
+
+    def _extract_created_at(self, register_response):
+        for key in ("created_at", "createdAt", "created_date", "date_created", "insert_date"):
+            value = register_response.get(key)
+            if value:
+                return value
+        return datetime.now().isoformat(timespec="seconds")
+
+    def _save_server_metadata(self, server_folder, register_response, host, workspace_name):
+        if not server_folder:
+            return
+
+        metadata = self._load_server_metadata()
+        metadata[server_folder.name] = {
+            "created_at": self._extract_created_at(register_response),
+            "workspace": workspace_name or "Unknown",
+            "host": self.format_host(host).rstrip("/"),
+            "id_device": register_response.get("id_device"),
+            "name": register_response.get("name") or register_response.get("device_name") or server_folder.name,
+        }
+
+        try:
+            with open(self._metadata_path(), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+            self.log.success("Server metadata saved.")
+        except Exception as e:
+            self.log.warning(f"Could not save server metadata: {e}")
 
     def _select_gpu(self, device_info):
         # Birden fazla GPU varsa kullanıcıdan seçim yapmasını iste
@@ -95,9 +140,10 @@ class Installer:
         self._select_gpu(device_info)
 
         # Workspace seçimi
-        workspace_user_id = self._get_workspace_id(host, token, workspace)
+        workspace_selection = self._get_workspace_id(host, token, workspace)
 
-        if workspace_user_id:
+        if workspace_selection:
+            workspace_user_id, workspace_name = workspace_selection
             self._set_workspace(host, token, workspace_user_id)
         else:
             return
@@ -119,7 +165,8 @@ class Installer:
             return
 
         # Server kurulumu
-        self._setup_server(register_response, host)
+        server_folder = self._setup_server(register_response, host)
+        self._save_server_metadata(server_folder, register_response, host, workspace_name)
 
     def _get_workspace_id(self, host, token, workspace):
         # Host ve endpoint ayarlama
@@ -167,7 +214,8 @@ class Installer:
                 if not workspace_user_id:
                     self.log.error("Workspace user ID not found in response")
                     return None
-                return workspace_user_id
+                workspace_name = workspace_list[0].get("workspace", {}).get("name", "Unknown")
+                return workspace_user_id, workspace_name
 
             self.log.info("There are multiple workspaces available for user. Current workspaces available:")
             for idx, workspaces in enumerate(workspace_list):
@@ -180,7 +228,9 @@ class Installer:
                 try:
                     choice = int(self.log.question("Please select a workspace to continue"))
                     if 1 <= choice <= len(workspace_list):
-                        return workspace_list[choice - 1]['id_workspace_user']
+                        selected_workspace = workspace_list[choice - 1]
+                        workspace_name = selected_workspace.get("workspace", {}).get("name", "Unknown")
+                        return selected_workspace['id_workspace_user'], workspace_name
                     else:
                         self.log.warning("Invalid selection. Please select a number from the list.")
                 except ValueError:
@@ -195,7 +245,7 @@ class Installer:
             if not workspace_user_id:
                 self.log.error(f"Workspace '{workspace}' does not have a valid user ID")
                 return None
-            return workspace_user_id
+            return workspace_user_id, workspace
 
     def _set_workspace(self, host, token, workspace_user_id):
         if workspace_user_id is None:
@@ -503,7 +553,8 @@ class Installer:
                 return
 
             # Extract and setup server
-            if not self._extract_and_setup_server(agent_response.content):
+            server_folder = self._extract_and_setup_server(agent_response.content)
+            if not server_folder:
                 return
 
             # Send deployment status
@@ -521,6 +572,8 @@ class Installer:
                 access_token=access_token,
                 endpoint=server_endpoint
             )
+
+            return server_folder
 
         except Exception as e:
             self.log.error(f"An error occurred while setting up the server: {e}")
@@ -577,7 +630,7 @@ class Installer:
                     "--no-cache")
 
             self.log.success("Server built successfully!")
-            return True
+            return agent_folder
 
         except zipfile.BadZipFile:
             self.log.error("Error: The downloaded file is not a valid zip file")

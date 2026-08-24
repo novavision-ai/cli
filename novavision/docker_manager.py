@@ -1,37 +1,131 @@
+import json
 import os
 import re
 import yaml
 import shutil
 import subprocess
 
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from novavision.logger import ConsoleLogger
 
+
 class DockerManager:
+    MONTHS = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    ]
+
     def __init__(self, logger):
         self.log = logger or ConsoleLogger()
+
+    def _metadata_path(self):
+        return Path.home() / ".novavision" / "servers.json"
+
+    def _load_server_metadata(self):
+        metadata_path = self._metadata_path()
+        if not metadata_path.exists():
+            return {}
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            self.log.warning(f"Could not read server metadata: {e}")
+            return {}
+
+    def _host_label(self, host):
+        if not host:
+            return "Unknown"
+
+        netloc = urlparse(host).netloc or host
+        hostname = netloc.lower()
+        if hostname.startswith("alfa."):
+            return "alfa"
+        if hostname.startswith("dev."):
+            return "dev"
+        if "suite.novavision.ai" in hostname:
+            return "suite"
+        return netloc
+
+    def _format_created_at(self, created_at):
+        if not created_at or created_at == "Unknown":
+            return "Unknown"
+
+        value = str(created_at).strip()
+        normalized = value.replace("Z", "+00:00")
+
+        try:
+            dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            for date_format in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt = datetime.strptime(value, date_format)
+                    break
+                except ValueError:
+                    dt = None
+            if dt is None:
+                return value
+
+        month = self.MONTHS[dt.month - 1]
+        return f"{dt.day} {month} {dt.year}, {dt:%H:%M}"
+
+    def _format_server_details(self, folder, metadata):
+        server_metadata = metadata.get(folder.name, {})
+        created_at = self._format_created_at(
+            server_metadata.get("created_at", "Unknown")
+        )
+        workspace = server_metadata.get("workspace", "Unknown")
+        host = server_metadata.get("host")
+        host_label = self._host_label(host)
+
+        return f"{folder.name} | Created: {created_at} | Workspace: {workspace} | Host: {host_label}"
 
     def choose_server_folder(self, server_path):
         server_folders = [item for item in server_path.iterdir() if item.is_dir()]
         visible_folders = [f for f in server_folders if not f.name.startswith(".")]
+        metadata = self._load_server_metadata()
 
         if not server_folders:
             self.log.error("No server folders found!")
             return None
 
         if len(visible_folders) == 1:
+            self.log.info(
+                f"Selected server: {self._format_server_details(visible_folders[0], metadata)}"
+            )
             return visible_folders[0]
         elif len(visible_folders) > 1:
             self.log.info("Multiple server folders found. Please select one")
             for idx, folder in enumerate(visible_folders):
-                self.log.info(f"{idx + 1}. {folder.name}")
+                self.log.info(
+                    f"{idx + 1}. {self._format_server_details(folder, metadata)}"
+                )
             while True:
                 try:
-                    choice = int(self.log.question("Enter the number of the server you want to select"))
+                    choice = int(
+                        self.log.question(
+                            "Enter the number of the server you want to select"
+                        )
+                    )
                     if 1 <= choice <= len(visible_folders):
                         return visible_folders[choice - 1]
                     else:
-                        self.log.warning("Invalid selection. Please enter a valid number.")
+                        self.log.warning(
+                            "Invalid selection. Please enter a valid number."
+                        )
                 except ValueError:
                     self.log.warning("Invalid input. Please enter a number.")
         return server_folders[0]
@@ -40,7 +134,9 @@ class DockerManager:
         try:
             result = subprocess.run(
                 ["docker", "network", "ls", "--format", "{{.Name}}"],
-                capture_output=True, text=True, check=True
+                capture_output=True,
+                text=True,
+                check=True,
             )
             network_names = result.stdout.strip().split("\n")
             for net in network_names:
@@ -49,7 +145,9 @@ class DockerManager:
                         subprocess.run(["docker", "network", "rm", net], check=True)
                         self.log.success(f"Removed network: {net}")
                     except subprocess.CalledProcessError:
-                        self.log.warning(f"Failed to remove network (maybe already removed): {net}")
+                        self.log.warning(
+                            f"Failed to remove network (maybe already removed): {net}"
+                        )
             return True
         except subprocess.CalledProcessError as e:
             self.log.error(f"Error listing networks: {e}")
@@ -67,7 +165,10 @@ class DockerManager:
                 image_name = config.get("image")
                 build_context = config.get("build", {}).get("context")
                 if image_name and build_context:
-                    build_info[service] = {"image": image_name, "context": build_context}
+                    build_info[service] = {
+                        "image": image_name,
+                        "context": build_context,
+                    }
 
             if not build_info:
                 self.log.error("No buildable services found in docker-compose.yml!")
@@ -84,18 +185,26 @@ class DockerManager:
 
         if command == "start":
             if type == "server":
-                server_folder = self.choose_server_folder(server_path) if select_server else None
+                server_folder = (
+                    self.choose_server_folder(server_path) if select_server else None
+                )
                 if server_folder is None and not select_server:
-                    server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+                    server_folders = [
+                        item for item in server_path.iterdir() if item.is_dir()
+                    ]
                     for folder in server_folders:
                         docker_compose_file = folder / "docker-compose.yml"
                         if docker_compose_file.exists():
                             try:
                                 self.run_docker_compose(docker_compose_file, "up", "-d")
                             except subprocess.CalledProcessError as e:
-                                self.log.error(f"Error starting server {folder.name}: {e}")
+                                self.log.error(
+                                    f"Error starting server {folder.name}: {e}"
+                                )
                 else:
-                    server_folder = server_folder or self.choose_server_folder(server_path)
+                    server_folder = server_folder or self.choose_server_folder(
+                        server_path
+                    )
                     docker_compose_file = server_folder / "docker-compose.yml"
                     self._start_server(docker_compose_file)
 
@@ -107,18 +216,28 @@ class DockerManager:
 
     def run_docker_compose(self, compose_file, *args):
         if shutil.which("docker"):
-            subprocess.run(["docker", "compose", "-f", str(compose_file)] + list(args), check=True)
+            subprocess.run(
+                ["docker", "compose", "-f", str(compose_file)] + list(args), check=True
+            )
         elif shutil.which("docker-compose"):
-            subprocess.run(["docker-compose", "-f", str(compose_file)] + list(args), check=True)
+            subprocess.run(
+                ["docker-compose", "-f", str(compose_file)] + list(args), check=True
+            )
 
     def _start_server(self, docker_compose_file):
-        previous_containers = set(subprocess.run(["docker", "ps", "-q"],
-                                              capture_output=True, text=True).stdout.strip().split("\n"))
+        previous_containers = set(
+            subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True)
+            .stdout.strip()
+            .split("\n")
+        )
         self.log.info("Starting server")
         try:
             self.run_docker_compose(docker_compose_file, "up", "-d")
-            result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
-                                 capture_output=True, text=True)
+            result = subprocess.run(
+                ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
+                capture_output=True,
+                text=True,
+            )
             self._display_new_containers(result.stdout, previous_containers)
         except subprocess.CalledProcessError as e:
             self.log.error(f"Error starting server: {e}")
@@ -139,13 +258,19 @@ class DockerManager:
                     self.run_docker_compose(docker_compose_file, "down", "--volumes")
                     self.log.success(f"Server {folder.name} stopped.")
                     if self.remove_network():
-                        self.log.success(f"Server {folder.name} network removed successfully.")
+                        self.log.success(
+                            f"Server {folder.name} network removed successfully."
+                        )
 
     def _stop_app(self, app_name):
         with self.log.loading("Stopping App"):
             try:
-                result = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}}"],
-                                     capture_output=True, text=True, check=True)
+                result = subprocess.run(
+                    ["docker", "ps", "--format", "{{.ID}} {{.Names}}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
                 if result.returncode != 0:
                     for line in result.stdout.strip().split("\n"):
                         container_id, container_name = line.split(" ", 1)
@@ -188,11 +313,13 @@ class DockerManager:
                 ["docker", "info"],
                 check=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
             )
             return True
         except subprocess.CalledProcessError:
-            self.log.error("Docker is not available or not running. Please activate docker first.")
+            self.log.error(
+                "Docker is not available or not running. Please activate docker first."
+            )
             return None
         except FileNotFoundError:
             self.log.error("Docker is not installed. Please install docker first.")
@@ -213,19 +340,32 @@ class DockerManager:
                 if build_info:
                     for image_name in build_info:
                         result = subprocess.run(
-                            ["docker", "ps", "-a", "--filter", f"ancestor={image_name}", "--format", "{{.Names}}"],
+                            [
+                                "docker",
+                                "ps",
+                                "-a",
+                                "--filter",
+                                f"ancestor={image_name}",
+                                "--format",
+                                "{{.Names}}",
+                            ],
                             capture_output=True,
                             text=True,
-                            check=True
+                            check=True,
                         )
-                        containers.update(name for name in result.stdout.strip().splitlines() if name and key in name)
+                        containers.update(
+                            name
+                            for name in result.stdout.strip().splitlines()
+                            if name and key in name
+                        )
 
             # Containerları sil
             for container_name in containers:
-                subprocess.run(["docker", "rm", "-f", container_name],
-                               check=True,
-                               stdout=subprocess.DEVNULL
-                               )
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
                 self.log.success(f"Container {container_name} removed.")
             return True
         except Exception as e:
@@ -238,7 +378,7 @@ class DockerManager:
             self._stop_server(server_path, select_server=False)
 
             try:
-                pattern = re.compile(r'^[A-Za-z0-9]{6}$')
+                pattern = re.compile(r"^[A-Za-z0-9]{6}$")
                 for server_name in os.listdir(server_path):
                     entry = server_path / server_name
                     if entry.is_dir() and pattern.match(server_name):
