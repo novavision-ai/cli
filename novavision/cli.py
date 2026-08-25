@@ -90,6 +90,11 @@ class NovaVisionCLI:
             help="AppID for App Choice",
             required=False
         )
+        stop_parser.add_argument(
+            "--close-apps",
+            action="store_true",
+            help="When stopping a server, also stop apps belonging to that server",
+        )
 
     def _add_service_parser(self, subparsers):
         service_parser = subparsers.add_parser(
@@ -142,11 +147,20 @@ class NovaVisionCLI:
         )
 
     def handle_docker_command(self, args):
+        if (
+            args.command == "stop"
+            and getattr(args, "close_apps", False)
+            and args.type != "server"
+        ):
+            logger.error("--close-apps can only be used with stop server.")
+            return
+
         if (args.type == "app" and args.id) or args.type == "server":
             self.docker.manage_docker(
                 command=args.command,
                 type=args.type,
-                app_name=args.id if args.type == "app" else None
+                app_name=args.id if args.type == "app" else None,
+                close_apps=getattr(args, "close_apps", False),
             )
         else:
             logger.error("Invalid arguments!")

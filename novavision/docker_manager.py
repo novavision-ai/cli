@@ -225,7 +225,9 @@ class DockerManager:
             self.log.error(f"Failed to read docker-compose.yml: {e}")
             return None
 
-    def manage_docker(self, command, type, app_name=None, select_server=True):
+    def manage_docker(
+        self, command, type, app_name=None, select_server=True, close_apps=False
+    ):
         default_path = Path.home() / ".novavision"
         server_path = default_path / "Server"
 
@@ -255,7 +257,9 @@ class DockerManager:
 
         elif command == "stop":
             if type == "server":
-                self._stop_server(server_path, select_server)
+                self._stop_server(
+                    server_path, select_server, close_apps=close_apps
+                )
             elif type == "app":
                 self._stop_app(app_name)
 
@@ -319,15 +323,89 @@ class DockerManager:
             self.log.error(f"Error starting server: {e}")
             return False
 
-    def _stop_server(self, server_path, select_server=True):
+    def _compose_container_ids(self, compose_file):
+        compose_command = self._docker_compose_command()
+        if not compose_command or not compose_file or not compose_file.exists():
+            return set()
+
+        result = subprocess.run(
+            compose_command + ["-f", str(compose_file), "ps", "-a", "-q"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return set()
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    def _running_containers(self):
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        containers = []
+        for line in result.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            container_id, _, container_name = line.partition("\t")
+            if container_id and container_name:
+                containers.append((container_id.strip(), container_name.strip()))
+        return containers
+
+    def close_server_apps(self, server_folder):
+        if not server_folder:
+            return False
+
+        server_compose = server_folder / "docker-compose.yml"
+        stopped = []
+
+        try:
+            nested_compose_files = [
+                compose_file
+                for compose_file in server_folder.rglob("docker-compose.yml")
+                if compose_file.resolve() != server_compose.resolve()
+            ]
+            for compose_file in nested_compose_files:
+                try:
+                    self.run_docker_compose(compose_file, "stop")
+                    self.log.info(f"Stopped app compose: {compose_file.parent.name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    self.log.warning(f"Could not stop app compose {compose_file}: {e}")
+
+            server_container_ids = self._compose_container_ids(server_compose)
+            for container_id, container_name in self._running_containers():
+                if container_id in server_container_ids:
+                    continue
+                if server_folder.name not in container_name:
+                    continue
+                subprocess.run(["docker", "stop", container_id], check=True)
+                stopped.append(container_name)
+
+            if stopped:
+                self.log.success(
+                    "Stopped apps: " + ", ".join(stopped)
+                )
+            else:
+                self.log.info("No running apps found for this server.")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            self.log.error(f"Error stopping server apps: {e}")
+            return False
+
+    def _stop_server(self, server_path, select_server=True, close_apps=False):
         if select_server:
             server_folder = self.choose_server_folder(server_path)
+            if close_apps:
+                self.close_server_apps(server_folder)
             self.stop_server_folder(server_folder)
         else:
             server_folders = [item for item in server_path.iterdir() if item.is_dir()]
             for folder in server_folders:
                 docker_compose_file = folder / "docker-compose.yml"
                 if docker_compose_file.exists():
+                    if close_apps:
+                        self.close_server_apps(folder)
                     self.run_docker_compose(docker_compose_file, "down", "--volumes")
                     self.log.success(f"Server {folder.name} stopped.")
                     if self.remove_network():
