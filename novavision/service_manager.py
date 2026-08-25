@@ -175,10 +175,58 @@ class ServiceManager:
             return subprocess.list2cmdline(args)
         return " ".join(shlex.quote(str(arg)) for arg in args)
 
-    def _windows_task_command(self, action, server_name):
+    def _server_service_log_paths(self, service_name, server_name):
+        log_dir = Path.home() / ".novavision" / "Server" / server_name / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            log_dir / f"{service_name}.out.log",
+            log_dir / f"{service_name}.err.log",
+        )
+
+    def _write_windows_task_script(self, action, server_name):
+        service_name = self._service_name(server_name)
+        server_folder = Path.home() / ".novavision" / "Server" / server_name
+        script_path = server_folder / "start-service.cmd"
         working_directory = subprocess.list2cmdline([str(self._working_directory())])
-        service_command = self._command_string(self._service_command(action, server_name))
-        return f"cmd /C cd /D {working_directory} && {service_command}"
+        service_command = self._command_string(
+            self._service_command(action, server_name)
+        )
+        stdout_log, stderr_log = self._server_service_log_paths(
+            service_name,
+            server_name,
+        )
+        script_content = f"""@echo off
+set "NV_OUT={stdout_log}"
+set "NV_ERR={stderr_log}"
+echo [%date% %time%] Starting NovaVision service {service_name} >> "%NV_OUT%"
+cd /D {working_directory} >> "%NV_OUT%" 2>> "%NV_ERR%"
+if errorlevel 1 exit /B %ERRORLEVEL%
+{service_command} >> "%NV_OUT%" 2>> "%NV_ERR%"
+exit /B %ERRORLEVEL%
+"""
+
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(script_content)
+
+        return script_path
+
+    def _write_windows_task_launcher(self, script_path):
+        launcher_path = script_path.with_suffix(".vbs")
+        launcher_content = f"""Set shell = CreateObject("WScript.Shell")
+command = Chr(34) & "{script_path}" & Chr(34)
+shell.Run command, 0, False
+"""
+
+        with open(launcher_path, "w", encoding="utf-8") as f:
+            f.write(launcher_content)
+
+        return launcher_path
+
+    def _windows_task_command(self, action, server_name):
+        script_path = self._write_windows_task_script(action, server_name)
+        launcher_path = self._write_windows_task_launcher(script_path)
+        wscript = shutil.which("wscript.exe") or "wscript.exe"
+        return subprocess.list2cmdline([wscript, str(launcher_path)])
 
     def _run_command(self, args, log_error=True):
         try:
@@ -509,7 +557,7 @@ WantedBy={scope["wanted_by"]}
                 "/TR",
                 task_command,
                 "/SC",
-                "ONSTART",
+                "ONLOGON",
                 "/F",
             ]
         ):

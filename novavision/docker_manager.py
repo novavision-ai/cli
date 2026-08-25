@@ -257,9 +257,7 @@ class DockerManager:
 
         elif command == "stop":
             if type == "server":
-                self._stop_server(
-                    server_path, select_server, close_apps=close_apps
-                )
+                self._stop_server(server_path, select_server, close_apps=close_apps)
             elif type == "app":
                 self._stop_app(app_name)
 
@@ -383,9 +381,7 @@ class DockerManager:
                 stopped.append(container_name)
 
             if stopped:
-                self.log.success(
-                    "Stopped apps: " + ", ".join(stopped)
-                )
+                self.log.success("Stopped apps: " + ", ".join(stopped))
             else:
                 self.log.info("No running apps found for this server.")
             return True
