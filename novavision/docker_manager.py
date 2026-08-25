@@ -4,6 +4,7 @@ import re
 import yaml
 import shutil
 import subprocess
+import time
 
 from datetime import datetime
 from pathlib import Path
@@ -90,8 +91,13 @@ class DockerManager:
         workspace = server_metadata.get("workspace", "Unknown")
         host = server_metadata.get("host")
         host_label = self._host_label(host)
+        service = server_metadata.get("service", {})
+        service_status = "enabled" if service.get("enabled") else "disabled"
 
-        return f"{folder.name} | Created: {created_at} | Workspace: {workspace} | Host: {host_label}"
+        return (
+            f"{folder.name} | Created: {created_at} | Workspace: {workspace} "
+            f"| Host: {host_label} | Service: {service_status}"
+        )
 
     def choose_server_folder(self, server_path):
         server_folders = [item for item in server_path.iterdir() if item.is_dir()]
@@ -129,6 +135,46 @@ class DockerManager:
                 except ValueError:
                     self.log.warning("Invalid input. Please enter a number.")
         return server_folders[0]
+
+    def get_server_folder(self, server_name=None):
+        server_path = Path.home() / ".novavision" / "Server"
+        if server_name:
+            server_folder = server_path / server_name
+            if not server_folder.is_dir():
+                self.log.error(f"Server folder not found: {server_name}")
+                return None
+            return server_folder
+        return self.choose_server_folder(server_path)
+
+    def start_server_folder(self, server_folder):
+        if not server_folder:
+            return False
+
+        docker_compose_file = server_folder / "docker-compose.yml"
+        if not docker_compose_file.exists():
+            self.log.error(f"No docker-compose.yml found in {server_folder}!")
+            return False
+
+        return self._start_server(docker_compose_file)
+
+    def stop_server_folder(self, server_folder):
+        if not server_folder:
+            return False
+
+        docker_compose_file = server_folder / "docker-compose.yml"
+        if not docker_compose_file.exists():
+            self.log.error(f"No docker-compose.yml found in {server_folder}!")
+            return False
+
+        try:
+            self.run_docker_compose(docker_compose_file, "down", "--volumes")
+            self.log.success("Server stopped.")
+            if self.remove_network():
+                self.log.success("Server network removed successfully.")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            self.log.error(f"Error stopping server: {e}")
+            return False
 
     def remove_network(self):
         try:
@@ -205,8 +251,7 @@ class DockerManager:
                     server_folder = server_folder or self.choose_server_folder(
                         server_path
                     )
-                    docker_compose_file = server_folder / "docker-compose.yml"
-                    self._start_server(docker_compose_file)
+                    self.start_server_folder(server_folder)
 
         elif command == "stop":
             if type == "server":
@@ -214,15 +259,45 @@ class DockerManager:
             elif type == "app":
                 self._stop_app(app_name)
 
-    def run_docker_compose(self, compose_file, *args):
+    def _docker_compose_command(self):
         if shutil.which("docker"):
-            subprocess.run(
-                ["docker", "compose", "-f", str(compose_file)] + list(args), check=True
+            return ["docker", "compose"]
+        if shutil.which("docker-compose"):
+            return ["docker-compose"]
+        return None
+
+    def run_docker_compose(self, compose_file, *args):
+        compose_command = self._docker_compose_command()
+        if not compose_command:
+            raise FileNotFoundError("Docker Compose is not available.")
+
+        subprocess.run(
+            compose_command + ["-f", str(compose_file)] + list(args),
+            check=True,
+        )
+
+    def wait_for_docker(self, timeout_seconds=300, interval_seconds=5):
+        if not shutil.which("docker"):
+            self.log.error("Docker is not installed. Please install Docker first.")
+            return False
+
+        self.log.info("Checking Docker availability")
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            result = subprocess.run(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-        elif shutil.which("docker-compose"):
-            subprocess.run(
-                ["docker-compose", "-f", str(compose_file)] + list(args), check=True
-            )
+            if result.returncode == 0:
+                self.log.success("Docker is available.")
+                return True
+            time.sleep(interval_seconds)
+
+        self.log.error(
+            f"Docker did not become available within {timeout_seconds} seconds."
+        )
+        return False
 
     def _start_server(self, docker_compose_file):
         previous_containers = set(
@@ -239,17 +314,15 @@ class DockerManager:
                 text=True,
             )
             self._display_new_containers(result.stdout, previous_containers)
-        except subprocess.CalledProcessError as e:
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
             self.log.error(f"Error starting server: {e}")
+            return False
 
     def _stop_server(self, server_path, select_server=True):
         if select_server:
             server_folder = self.choose_server_folder(server_path)
-            docker_compose_file = server_folder / "docker-compose.yml"
-            self.run_docker_compose(docker_compose_file, "down", "--volumes")
-            self.log.success("Server stopped.")
-            if self.remove_network():
-                self.log.success("Server network removed successfully.")
+            self.stop_server_folder(server_folder)
         else:
             server_folders = [item for item in server_path.iterdir() if item.is_dir()]
             for folder in server_folders:

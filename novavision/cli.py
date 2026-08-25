@@ -1,15 +1,18 @@
 import argparse
+import sys
 from pathlib import Path
 from datetime import datetime
 from novavision.logger import ConsoleLogger
 from novavision.installer import Installer
 from novavision.docker_manager import DockerManager
+from novavision.service_manager import ServiceManager
 
 logger = ConsoleLogger()
 
 class NovaVisionCLI:
     def __init__(self):
         self.docker = DockerManager(logger=logger)
+        self.service = ServiceManager(logger=logger, docker_manager=self.docker)
         self.installer = None  # will be created per install with file logger
 
     def create_parser(self):
@@ -20,6 +23,7 @@ class NovaVisionCLI:
         self._add_install_parser(subparsers)
         self._add_start_parser(subparsers)
         self._add_stop_parser(subparsers)
+        self._add_service_parser(subparsers)
 
         return parser
 
@@ -77,6 +81,42 @@ class NovaVisionCLI:
             required=False
         )
 
+    def _add_service_parser(self, subparsers):
+        service_parser = subparsers.add_parser(
+            "service",
+            help="Manages server service integration")
+        service_parser.add_argument(
+            "action",
+            choices=["enable", "disable", "status"],
+            help="Service action"
+        )
+        service_parser.add_argument(
+            "type",
+            choices=["server"],
+            help="Type of service to manage"
+        )
+        service_parser.add_argument(
+            "--id",
+            help="Server folder ID",
+            required=False
+        )
+
+    def _create_internal_service_parser(self):
+        service_parser = argparse.ArgumentParser(
+            prog="novavision _service",
+            description=argparse.SUPPRESS)
+        service_parser.add_argument(
+            "action",
+            choices=["start-server", "stop-server"],
+            help=argparse.SUPPRESS
+        )
+        service_parser.add_argument(
+            "--server",
+            required=True,
+            help=argparse.SUPPRESS
+        )
+        return service_parser
+
     def handle_install(self, args):
         log_dir = Path.home() / ".novavision"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -101,7 +141,39 @@ class NovaVisionCLI:
         else:
             logger.error("Invalid arguments!")
 
+    def handle_service_command(self, args):
+        if args.type != "server":
+            logger.error("Only server services are supported.")
+            raise SystemExit(1)
+
+        if args.action == "enable":
+            success = self.service.enable_server(server_name=args.id)
+        elif args.action == "disable":
+            success = self.service.disable_server(server_name=args.id)
+        elif args.action == "status":
+            success = self.service.status_server(server_name=args.id)
+        else:
+            logger.error(f"Unknown service action: {args.action}")
+            raise SystemExit(1)
+
+        if not success:
+            raise SystemExit(1)
+
+    def handle_internal_service_command(self, args):
+        success = self.service.run_service_action(
+            action=args.action,
+            server_name=args.server
+        )
+        if not success:
+            raise SystemExit(1)
+
     def run(self):
+        if len(sys.argv) > 1 and sys.argv[1] == "_service":
+            parser = self._create_internal_service_parser()
+            args = parser.parse_args(sys.argv[2:])
+            self.handle_internal_service_command(args)
+            return
+
         parser = self.create_parser()
         args = parser.parse_args()
 
@@ -110,6 +182,8 @@ class NovaVisionCLI:
                 self.handle_install(args)
             elif args.command in ["start", "stop"]:
                 self.handle_docker_command(args)
+            elif args.command == "service":
+                self.handle_service_command(args)
             else:
                 logger.error(f"Unknown command: {args.command}")
         except Exception as e:

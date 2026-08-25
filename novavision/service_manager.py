@@ -1,0 +1,529 @@
+import json
+import os
+import platform
+import plistlib
+import shlex
+import shutil
+import subprocess
+import sys
+
+from pathlib import Path
+from novavision.docker_manager import DockerManager
+from novavision.logger import ConsoleLogger
+
+
+class ServiceManager:
+    def __init__(self, logger=None, docker_manager=None):
+        self.log = logger or ConsoleLogger()
+        self.docker = docker_manager or DockerManager(logger=self.log)
+
+    def enable_server(self, server_name=None):
+        server_folder = self.docker.get_server_folder(server_name)
+        if not server_folder:
+            return False
+
+        if not self._validate_service_privileges():
+            return False
+
+        if not self._validate_docker_startup():
+            return False
+
+        service_name = self._service_name(server_folder.name)
+        result = self._enable_native_service(service_name, server_folder.name)
+        if not result:
+            return False
+
+        self._update_service_metadata(
+            server_folder.name,
+            enabled=True,
+            provider=result["provider"],
+            service_name=service_name,
+        )
+        self.log.success(f"Service enabled for server {server_folder.name}.")
+        return True
+
+    def disable_server(self, server_name=None):
+        server_folder = self.docker.get_server_folder(server_name)
+        if not server_folder:
+            return False
+
+        service_name = self._service_name(server_folder.name)
+        provider = self._provider_name()
+        if not self._disable_native_service(service_name):
+            return False
+
+        self._update_service_metadata(
+            server_folder.name,
+            enabled=False,
+            provider=provider,
+            service_name=service_name,
+        )
+        self.log.success(f"Service disabled for server {server_folder.name}.")
+        return True
+
+    def status_server(self, server_name=None):
+        server_folder = self.docker.get_server_folder(server_name)
+        if not server_folder:
+            return False
+
+        service_name = self._service_name(server_folder.name)
+        provider = self._provider_name()
+        metadata = self._load_metadata().get(server_folder.name, {})
+        service_metadata = metadata.get("service", {})
+        enabled = service_metadata.get("enabled", False)
+
+        self.log.info(f"Server: {server_folder.name}")
+        self.log.info(f"Service: {'enabled' if enabled else 'disabled'}")
+        self.log.info(f"Provider: {service_metadata.get('provider', provider)}")
+        self.log.info(f"Name: {service_metadata.get('name', service_name)}")
+        return self._status_native_service(service_name)
+
+    def run_service_action(self, action, server_name):
+        server_folder = self.docker.get_server_folder(server_name)
+        if not server_folder:
+            return False
+
+        if action == "start-server":
+            if not self.docker.wait_for_docker():
+                return False
+            return self.docker.start_server_folder(server_folder)
+        if action == "stop-server":
+            return self.docker.stop_server_folder(server_folder)
+
+        self.log.error(f"Unknown service action: {action}")
+        return False
+
+    def _provider_name(self):
+        system = platform.system()
+        if system == "Linux":
+            return "systemd"
+        if system == "Darwin":
+            return "launchd"
+        if system == "Windows":
+            return "task-scheduler"
+        return system.lower() or "unknown"
+
+    def _metadata_path(self):
+        return Path.home() / ".novavision" / "servers.json"
+
+    def _load_metadata(self):
+        metadata_path = self._metadata_path()
+        if not metadata_path.exists():
+            return {}
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            self.log.warning(f"Could not read server metadata: {e}")
+            return {}
+
+    def _save_metadata(self, metadata):
+        metadata_path = self._metadata_path()
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+            return True
+        except Exception as e:
+            self.log.error(f"Could not save server metadata: {e}")
+            return False
+
+    def _update_service_metadata(self, server_name, enabled, provider, service_name):
+        metadata = self._load_metadata()
+        server_metadata = metadata.setdefault(server_name, {})
+        server_metadata["service"] = {
+            "enabled": enabled,
+            "provider": provider,
+            "name": service_name,
+        }
+        self._save_metadata(metadata)
+
+    def _service_name(self, server_name):
+        return f"novavision-server-{server_name}"
+
+    def _working_directory(self):
+        return Path(__file__).resolve().parent.parent
+
+    def _console_script_command(self):
+        invoked_command = Path(sys.argv[0])
+        if invoked_command.name.lower().startswith("novavision"):
+            if invoked_command.is_absolute():
+                return [str(invoked_command)]
+
+            executable = shutil.which(str(invoked_command))
+            return [executable or str(invoked_command)]
+
+        return None
+
+    def _service_command(self, action, server_name):
+        command = self._console_script_command() or [
+            sys.executable,
+            "-m",
+            "novavision.cli",
+        ]
+        return command + [
+            "_service",
+            action,
+            "--server",
+            server_name,
+        ]
+
+    def _command_string(self, args):
+        if platform.system() == "Windows":
+            return subprocess.list2cmdline(args)
+        return " ".join(shlex.quote(str(arg)) for arg in args)
+
+    def _windows_task_command(self, action, server_name):
+        working_directory = subprocess.list2cmdline([str(self._working_directory())])
+        service_command = self._command_string(self._service_command(action, server_name))
+        return f"cmd /C cd /D {working_directory} && {service_command}"
+
+    def _run_command(self, args, log_error=True):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True)
+        except FileNotFoundError:
+            if log_error:
+                self.log.error(f"Command not found: {args[0]}")
+            return False
+
+        if result.returncode != 0:
+            if log_error:
+                message = result.stderr.strip() or result.stdout.strip()
+                self.log.error(message or f"Command failed: {' '.join(args)}")
+            return False
+        return True
+
+    def _run_status_command(self, args):
+        try:
+            return subprocess.run(args, capture_output=True, text=True)
+        except FileNotFoundError:
+            self.log.error(f"Command not found: {args[0]}")
+            return None
+
+    def _enable_native_service(self, service_name, server_name):
+        system = platform.system()
+        if system == "Linux":
+            return self._enable_systemd_service(service_name, server_name)
+        if system == "Darwin":
+            return self._enable_launchd_service(service_name, server_name)
+        if system == "Windows":
+            return self._enable_windows_task(service_name, server_name)
+
+        self.log.error(f"Unsupported operating system: {system}")
+        return None
+
+    def _disable_native_service(self, service_name):
+        system = platform.system()
+        if system == "Linux":
+            return self._disable_systemd_service(service_name)
+        if system == "Darwin":
+            return self._disable_launchd_service(service_name)
+        if system == "Windows":
+            return self._disable_windows_task(service_name)
+
+        self.log.error(f"Unsupported operating system: {system}")
+        return False
+
+    def _status_native_service(self, service_name):
+        system = platform.system()
+        if system == "Linux":
+            return self._status_systemd_service(service_name)
+        if system == "Darwin":
+            return self._status_launchd_service(service_name)
+        if system == "Windows":
+            return self._status_windows_task(service_name)
+
+        self.log.error(f"Unsupported operating system: {system}")
+        return False
+
+    def _is_root(self):
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+
+    def _is_windows_admin(self):
+        if platform.system() != "Windows":
+            return False
+
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _validate_service_privileges(self):
+        system = platform.system()
+        if system == "Linux" and not self._is_root():
+            self.log.error(
+                "Linux boot startup requires root. "
+                "Run this command with sudo or as root."
+            )
+            return False
+        if system == "Darwin" and not self._is_root():
+            self.log.error(
+                "macOS boot startup requires root. "
+                "Run this command with sudo or as root."
+            )
+            return False
+        if system == "Windows" and not self._is_windows_admin():
+            self.log.error(
+                "Windows boot startup requires an Administrator terminal. "
+                "Reopen the terminal as Administrator and run this command again."
+            )
+            return False
+        return True
+
+    def _validate_docker_startup(self):
+        if not shutil.which("docker"):
+            self.log.error("Docker is not installed. Please install Docker first.")
+            return False
+
+        system = platform.system()
+        if system == "Linux":
+            return self._validate_linux_docker_startup()
+        if system in ["Darwin", "Windows"]:
+            return self._confirm_docker_desktop_startup(system)
+
+        return True
+
+    def _validate_linux_docker_startup(self):
+        result = self._run_status_command(["systemctl", "is-enabled", "docker"])
+        if result and result.returncode == 0:
+            return True
+
+        self.log.error(
+            "Docker is not enabled at startup. "
+            "Run 'sudo systemctl enable docker' before enabling the NovaVision service."
+        )
+        return False
+
+    def _confirm_docker_desktop_startup(self, system):
+        os_name = "macOS" if system == "Darwin" else "Windows"
+        answer = (
+            self.log.question(
+                f"Docker Desktop must be configured to start automatically on {os_name}. "
+                "Is Docker Desktop startup enabled? (y/n)"
+            )
+            .strip()
+            .lower()
+        )
+
+        if answer == "y":
+            return True
+
+        self.log.error(
+            "Enable Docker Desktop startup first, then run this command again."
+        )
+        return False
+
+    def _systemd_scope(self):
+        return {
+            "provider": "systemd",
+            "unit_dir": Path("/etc/systemd/system"),
+            "control": ["systemctl"],
+            "wanted_by": "multi-user.target",
+            "unit_name": None,
+        }
+
+    def _enable_systemd_service(self, service_name, server_name):
+        if not self._is_root():
+            self.log.error(
+                "Linux boot startup requires root. "
+                "Run this command with sudo or as root."
+            )
+            return None
+
+        scope = self._systemd_scope()
+        unit_name = f"{service_name}.service"
+        unit_path = scope["unit_dir"] / unit_name
+        start_command = self._command_string(
+            self._service_command("start-server", server_name)
+        )
+        stop_command = self._command_string(
+            self._service_command("stop-server", server_name)
+        )
+        working_directory = shlex.quote(str(self._working_directory()))
+
+        unit_content = f"""[Unit]
+Description=NovaVision Server {server_name}
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={working_directory}
+ExecStart={start_command}
+ExecStop={stop_command}
+TimeoutStartSec=0
+
+[Install]
+WantedBy={scope["wanted_by"]}
+"""
+
+        try:
+            scope["unit_dir"].mkdir(parents=True, exist_ok=True)
+            with open(unit_path, "w", encoding="utf-8") as f:
+                f.write(unit_content)
+        except PermissionError:
+            self.log.error(
+                f"Permission denied while writing {unit_path}. Run as administrator/root."
+            )
+            return None
+
+        if not self._run_command(scope["control"] + ["daemon-reload"]):
+            return None
+        if not self._run_command(scope["control"] + ["enable", unit_name]):
+            return None
+
+        self.log.info(f"Installed systemd unit: {unit_path}")
+        return {"provider": scope["provider"], "path": str(unit_path)}
+
+    def _disable_systemd_service(self, service_name):
+        scope = self._systemd_scope()
+        unit_name = f"{service_name}.service"
+        unit_path = scope["unit_dir"] / unit_name
+
+        self._run_command(scope["control"] + ["disable", unit_name])
+        if unit_path.exists():
+            try:
+                unit_path.unlink()
+            except PermissionError:
+                self.log.error(f"Permission denied while removing {unit_path}.")
+                return False
+
+        return self._run_command(scope["control"] + ["daemon-reload"])
+
+    def _status_systemd_service(self, service_name):
+        scope = self._systemd_scope()
+        unit_name = f"{service_name}.service"
+        enabled = self._run_status_command(scope["control"] + ["is-enabled", unit_name])
+        active = self._run_status_command(scope["control"] + ["is-active", unit_name])
+
+        enabled_text = (
+            enabled.stdout.strip() if enabled and enabled.stdout else "unknown"
+        )
+        active_text = active.stdout.strip() if active and active.stdout else "unknown"
+        self.log.info(f"Native enabled: {enabled_text}")
+        self.log.info(f"Native active: {active_text}")
+        return True
+
+    def _launchd_scope(self):
+        return {
+            "provider": "launchd-daemon",
+            "plist_dir": Path("/Library/LaunchDaemons"),
+            "domain": "system",
+        }
+
+    def _enable_launchd_service(self, service_name, server_name):
+        if not self._is_root():
+            self.log.error(
+                "macOS boot startup requires root. "
+                "Run this command with sudo or as root."
+            )
+            return None
+
+        scope = self._launchd_scope()
+        label = service_name.replace("-", ".")
+        plist_path = scope["plist_dir"] / f"{label}.plist"
+        log_dir = Path.home() / ".novavision" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        plist_data = {
+            "Label": label,
+            "ProgramArguments": self._service_command("start-server", server_name),
+            "WorkingDirectory": str(self._working_directory()),
+            "RunAtLoad": True,
+            "StandardOutPath": str(log_dir / f"{service_name}.out.log"),
+            "StandardErrorPath": str(log_dir / f"{service_name}.err.log"),
+        }
+
+        try:
+            scope["plist_dir"].mkdir(parents=True, exist_ok=True)
+            with open(plist_path, "wb") as f:
+                plistlib.dump(plist_data, f)
+        except PermissionError:
+            self.log.error(
+                f"Permission denied while writing {plist_path}. Run as administrator/root."
+            )
+            return None
+
+        self._run_command(
+            ["launchctl", "bootout", scope["domain"], str(plist_path)],
+            log_error=False,
+        )
+        if not self._run_command(
+            ["launchctl", "bootstrap", scope["domain"], str(plist_path)]
+        ):
+            return None
+        self._run_command(["launchctl", "enable", f"{scope['domain']}/{label}"])
+
+        self.log.info(f"Installed launchd plist: {plist_path}")
+        return {"provider": scope["provider"], "path": str(plist_path)}
+
+    def _disable_launchd_service(self, service_name):
+        scope = self._launchd_scope()
+        label = service_name.replace("-", ".")
+        plist_path = scope["plist_dir"] / f"{label}.plist"
+
+        self._run_command(
+            ["launchctl", "bootout", scope["domain"], str(plist_path)],
+            log_error=False,
+        )
+        if plist_path.exists():
+            try:
+                plist_path.unlink()
+            except PermissionError:
+                self.log.error(f"Permission denied while removing {plist_path}.")
+                return False
+        return True
+
+    def _status_launchd_service(self, service_name):
+        scope = self._launchd_scope()
+        label = service_name.replace("-", ".")
+        result = self._run_status_command(
+            ["launchctl", "print", f"{scope['domain']}/{label}"]
+        )
+        if result and result.returncode == 0:
+            self.log.info("Native status: loaded")
+        else:
+            self.log.info("Native status: not loaded")
+        return True
+
+    def _enable_windows_task(self, service_name, server_name):
+        if not self._is_windows_admin():
+            self.log.error(
+                "Windows boot startup requires an Administrator terminal. "
+                "Reopen the terminal as Administrator and run this command again."
+            )
+            return None
+
+        task_command = self._windows_task_command("start-server", server_name)
+        if not self._run_command(
+            [
+                "schtasks",
+                "/Create",
+                "/TN",
+                service_name,
+                "/TR",
+                task_command,
+                "/SC",
+                "ONSTART",
+                "/F",
+            ]
+        ):
+            return None
+
+        return {"provider": "task-scheduler", "path": service_name}
+
+    def _disable_windows_task(self, service_name):
+        return self._run_command(["schtasks", "/Delete", "/TN", service_name, "/F"])
+
+    def _status_windows_task(self, service_name):
+        result = self._run_status_command(["schtasks", "/Query", "/TN", service_name])
+        if result and result.returncode == 0:
+            self.log.info("Native status: registered")
+        else:
+            self.log.info("Native status: not registered")
+        return True
