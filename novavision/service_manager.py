@@ -15,6 +15,8 @@ from novavision.logger import ConsoleLogger
 class ServiceManager:
     def __init__(self, logger=None, docker_manager=None):
         self.log = logger or ConsoleLogger()
+        self.service_home = self._resolve_service_home()
+        self._apply_service_home()
         self.docker = docker_manager or DockerManager(logger=self.log)
 
     def enable_server(self, server_name=None):
@@ -98,13 +100,66 @@ class ServiceManager:
         if system == "Linux":
             return "systemd"
         if system == "Darwin":
-            return "launchd"
+            return "launchd-agent"
         if system == "Windows":
             return "task-scheduler"
         return system.lower() or "unknown"
 
     def _metadata_path(self):
-        return Path.home() / ".novavision" / "servers.json"
+        return self.service_home / ".novavision" / "servers.json"
+
+    def _sudo_user(self):
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and sudo_user != "root":
+            return sudo_user
+        return None
+
+    def _resolve_service_home(self):
+        if platform.system() in ["Linux", "Darwin"]:
+            sudo_user = self._sudo_user()
+            if sudo_user:
+                try:
+                    import pwd
+
+                    return Path(pwd.getpwnam(sudo_user).pw_dir)
+                except Exception:
+                    pass
+
+        return Path.home()
+
+    def _apply_service_home(self):
+        if platform.system() in ["Linux", "Darwin"] and self._sudo_user():
+            os.environ["HOME"] = str(self.service_home)
+
+    def _service_uid(self):
+        sudo_uid = os.environ.get("SUDO_UID")
+        if sudo_uid and sudo_uid.isdigit():
+            return int(sudo_uid)
+        if hasattr(os, "getuid"):
+            return os.getuid()
+        return None
+
+    def _service_gid(self):
+        sudo_gid = os.environ.get("SUDO_GID")
+        if sudo_gid and sudo_gid.isdigit():
+            return int(sudo_gid)
+        if hasattr(os, "getgid"):
+            return os.getgid()
+        return None
+
+    def _chown_to_service_user(self, path):
+        if not self._is_root() or not self._sudo_user():
+            return
+
+        uid = self._service_uid()
+        gid = self._service_gid()
+        if uid is None or gid is None:
+            return
+
+        try:
+            os.chown(path, uid, gid)
+        except (AttributeError, OSError):
+            pass
 
     def _load_metadata(self):
         metadata_path = self._metadata_path()
@@ -175,9 +230,14 @@ class ServiceManager:
             return subprocess.list2cmdline(args)
         return " ".join(shlex.quote(str(arg)) for arg in args)
 
+    def _systemd_quote(self, value):
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     def _server_service_log_paths(self, service_name, server_name):
-        log_dir = Path.home() / ".novavision" / "Server" / server_name / "logs"
+        log_dir = self.service_home / ".novavision" / "Server" / server_name / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
+        self._chown_to_service_user(log_dir)
         return (
             log_dir / f"{service_name}.out.log",
             log_dir / f"{service_name}.err.log",
@@ -185,7 +245,7 @@ class ServiceManager:
 
     def _write_windows_task_script(self, action, server_name):
         service_name = self._service_name(server_name)
-        server_folder = Path.home() / ".novavision" / "Server" / server_name
+        server_folder = self.service_home / ".novavision" / "Server" / server_name
         script_path = server_folder / "start-service.cmd"
         working_directory = subprocess.list2cmdline([str(self._working_directory())])
         service_command = self._command_string(
@@ -308,12 +368,6 @@ shell.Run command, 0, False
                 "Run this command with sudo or as root."
             )
             return False
-        if system == "Darwin" and not self._is_root():
-            self.log.error(
-                "macOS boot startup requires root. "
-                "Run this command with sudo or as root."
-            )
-            return False
         if system == "Windows" and not self._is_windows_admin():
             self.log.error(
                 "Windows boot startup requires an Administrator terminal. "
@@ -392,6 +446,7 @@ shell.Run command, 0, False
             self._service_command("stop-server", server_name)
         )
         working_directory = shlex.quote(str(self._working_directory()))
+        home_environment = self._systemd_quote(f"HOME={self.service_home}")
 
         unit_content = f"""[Unit]
 Description=NovaVision Server {server_name}
@@ -402,6 +457,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory={working_directory}
+Environment={home_environment}
 ExecStart={start_command}
 ExecStop={stop_command}
 TimeoutStartSec=0
@@ -458,43 +514,39 @@ WantedBy={scope["wanted_by"]}
         return True
 
     def _launchd_scope(self):
+        uid = self._service_uid()
         return {
-            "provider": "launchd-daemon",
-            "plist_dir": Path("/Library/LaunchDaemons"),
-            "domain": "system",
+            "provider": "launchd-agent",
+            "plist_dir": self.service_home / "Library" / "LaunchAgents",
+            "domain": f"gui/{uid}" if uid is not None else "gui",
         }
 
     def _enable_launchd_service(self, service_name, server_name):
-        if not self._is_root():
-            self.log.error(
-                "macOS boot startup requires root. "
-                "Run this command with sudo or as root."
-            )
-            return None
-
         scope = self._launchd_scope()
         label = service_name.replace("-", ".")
         plist_path = scope["plist_dir"] / f"{label}.plist"
-        log_dir = Path.home() / ".novavision" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log, stderr_log = self._server_service_log_paths(
+            service_name,
+            server_name,
+        )
 
         plist_data = {
             "Label": label,
             "ProgramArguments": self._service_command("start-server", server_name),
             "WorkingDirectory": str(self._working_directory()),
             "RunAtLoad": True,
-            "StandardOutPath": str(log_dir / f"{service_name}.out.log"),
-            "StandardErrorPath": str(log_dir / f"{service_name}.err.log"),
+            "StandardOutPath": str(stdout_log),
+            "StandardErrorPath": str(stderr_log),
         }
 
         try:
             scope["plist_dir"].mkdir(parents=True, exist_ok=True)
+            self._chown_to_service_user(scope["plist_dir"])
             with open(plist_path, "wb") as f:
                 plistlib.dump(plist_data, f)
+            self._chown_to_service_user(plist_path)
         except PermissionError:
-            self.log.error(
-                f"Permission denied while writing {plist_path}. Run as administrator/root."
-            )
+            self.log.error(f"Permission denied while writing {plist_path}.")
             return None
 
         self._run_command(
