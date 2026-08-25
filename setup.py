@@ -1,4 +1,5 @@
 from setuptools import setup, find_packages
+from novavision import __version__
 
 long_description = ""
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -6,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name='novavision-cli',
-    version='0.0.10',
+    version=__version__,
     packages=find_packages(),
     include_package_data=True,
     install_requires=["requests==2.32.3",

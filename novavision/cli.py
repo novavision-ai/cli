@@ -2,6 +2,7 @@ import argparse
 import sys
 from pathlib import Path
 from datetime import datetime
+from novavision import __version__
 from novavision.logger import ConsoleLogger
 from novavision.installer import Installer
 from novavision.docker_manager import DockerManager
@@ -16,7 +17,16 @@ class NovaVisionCLI:
         self.installer = None  # will be created per install with file logger
 
     def create_parser(self):
-        parser = argparse.ArgumentParser(description="NovaVision CLI Tool")
+        parser = argparse.ArgumentParser(
+            prog="novavision",
+            description="NovaVision CLI Tool"
+        )
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=f"%(prog)s {__version__}"
+        )
         subparsers = parser.add_subparsers(dest="command", help="Available commands")
         subparsers.required = True
 
