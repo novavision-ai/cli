@@ -127,8 +127,6 @@ jobs:
           sudo "$novavision_bin" service disable server --id ci-server
 
       - name: Live install against NovaVision API
-        if: github.event_name != 'pull_request'
-        continue-on-error: true
         env:
           NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
           NOVAVISION_WORKSPACE: ${{ secrets.NOVAVISION_WORKSPACE || vars.NOVAVISION_WORKSPACE }}
@@ -136,12 +134,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${NOVAVISION_USER_TOKEN:-}" ] || [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
-            echo "NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is not set; skipping live install."
-            exit 0
+            echo "::error::NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is missing. Add them under Settings → Secrets and variables → Actions."
+            exit 1
           fi
           printf 'y\n' | novavision install local "$NOVAVISION_USER_TOKEN" \
             --host "$NOVAVISION_HOST" \
             --workspace "$NOVAVISION_WORKSPACE"
+          if ! ls "$HOME/.novavision/Server"/*/docker-compose.yml >/dev/null 2>&1; then
+            echo "::error::novavision install did not create a server compose file."
+            exit 1
+          fi
           novavision start server
           app_id="$(python - <<'PY'
           from pathlib import Path
@@ -151,10 +153,12 @@ jobs:
           print(apps[0] if apps else "")
           PY
           )"
-          if [ -n "$app_id" ]; then
-            novavision start app --id "$app_id"
-            novavision stop app --id "$app_id"
+          if [ -z "$app_id" ]; then
+            echo "::error::install succeeded but no app compose file was found."
+            exit 1
           fi
+          novavision start app --id "$app_id"
+          novavision stop app --id "$app_id"
           novavision stop server --close-apps
 
       - name: Upload coverage and logs
