@@ -127,7 +127,7 @@ jobs:
           sudo "$novavision_bin" service disable server --id ci-server
 
       - name: Live install against NovaVision API
-        if: ${{ secrets.NOVAVISION_USER_TOKEN != '' && github.event_name != 'pull_request' }}
+        if: github.event_name != 'pull_request'
         continue-on-error: true
         env:
           NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
@@ -135,8 +135,8 @@ jobs:
           NOVAVISION_HOST: ${{ secrets.NOVAVISION_HOST || vars.NOVAVISION_HOST || 'alfa.suite.novavision.ai' }}
         run: |
           set -euo pipefail
-          if [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
-            echo "NOVAVISION_WORKSPACE is not set; skipping live install."
+          if [ -z "${NOVAVISION_USER_TOKEN:-}" ] || [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
+            echo "NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is not set; skipping live install."
             exit 0
           fi
           printf 'y\n' | novavision install local "$NOVAVISION_USER_TOKEN" \
