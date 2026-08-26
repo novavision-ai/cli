@@ -29,6 +29,9 @@ def test_install_parses_token_host_and_workspace():
             "alfa.suite.novavision.ai",
             "--workspace",
             "ci-workspace",
+            "--port",
+            "7001",
+            "--non-interactive",
         ]
     )
     assert args.command == "install"
@@ -36,6 +39,23 @@ def test_install_parses_token_host_and_workspace():
     assert args.token == "ci-token"
     assert args.host == "alfa.suite.novavision.ai"
     assert args.workspace == "ci-workspace"
+    assert args.port == "7001"
+    assert args.non_interactive is True
+
+
+def test_uninstall_parses_token_and_id():
+    args = _parser().parse_args(["uninstall", "server", "ci-token", "--id", "abcdef"])
+    assert args.command == "uninstall"
+    assert args.type == "server"
+    assert args.token == "ci-token"
+    assert args.id == "abcdef"
+
+
+def test_start_server_accepts_id():
+    args = _parser().parse_args(["start", "server", "--id", "abcdef"])
+    assert args.command == "start"
+    assert args.type == "server"
+    assert args.id == "abcdef"
 
 
 def test_start_app_accepts_id():

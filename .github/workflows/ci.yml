@@ -54,7 +54,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -126,41 +126,6 @@ jobs:
           sudo "$novavision_bin" service status server --id ci-server
           sudo "$novavision_bin" service disable server --id ci-server
 
-      - name: Live install against NovaVision API
-        env:
-          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
-          NOVAVISION_WORKSPACE: ${{ secrets.NOVAVISION_WORKSPACE || vars.NOVAVISION_WORKSPACE }}
-          NOVAVISION_HOST: ${{ secrets.NOVAVISION_HOST || vars.NOVAVISION_HOST || 'alfa.suite.novavision.ai' }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NOVAVISION_USER_TOKEN:-}" ] || [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
-            echo "::error::NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is missing. Add them under Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-          printf 'y\n' | novavision install local "$NOVAVISION_USER_TOKEN" \
-            --host "$NOVAVISION_HOST" \
-            --workspace "$NOVAVISION_WORKSPACE"
-          if ! ls "$HOME/.novavision/Server"/*/docker-compose.yml >/dev/null 2>&1; then
-            echo "::error::novavision install did not create a server compose file."
-            exit 1
-          fi
-          novavision start server
-          app_id="$(python - <<'PY'
-          from pathlib import Path
-
-          root = Path.home() / ".novavision" / "Server"
-          apps = [path.parent.name for path in root.glob("*/*/docker-compose.yml")]
-          print(apps[0] if apps else "")
-          PY
-          )"
-          if [ -z "$app_id" ]; then
-            echo "::error::install succeeded but no app compose file was found."
-            exit 1
-          fi
-          novavision start app --id "$app_id"
-          novavision stop app --id "$app_id"
-          novavision stop server --close-apps
-
       - name: Upload coverage and logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -172,6 +137,114 @@ jobs:
             unit-test-results.xml
             ${{ github.workspace }}/.coverage
             /home/runner/.novavision/**/*.log
+
+  test-linux-live:
+    name: test-linux-live
+    needs: [changes, test-linux]
+    if: >
+      needs.changes.outputs.run_ci == 'true' &&
+      needs.test-linux.result == 'success' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.base_ref == 'main')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: live-install
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Live install against NovaVision API
+        id: live_install
+        env:
+          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
+          NOVAVISION_WORKSPACE: ${{ secrets.NOVAVISION_WORKSPACE || vars.NOVAVISION_WORKSPACE }}
+          NOVAVISION_HOST: ${{ secrets.NOVAVISION_HOST || vars.NOVAVISION_HOST || 'alfa.suite.novavision.ai' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOVAVISION_USER_TOKEN:-}" ] || [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
+            echo "::error::NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is missing. Add them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          set +e
+          novavision install local "$NOVAVISION_USER_TOKEN" \
+            --host "$NOVAVISION_HOST" \
+            --workspace "$NOVAVISION_WORKSPACE" \
+            --port 7001 \
+            --non-interactive
+          install_status=$?
+          set -e
+          live_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta_path = Path.home() / ".novavision" / "servers.json"
+          if not meta_path.exists():
+              print("")
+              raise SystemExit(0)
+          metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+          live = [
+              name
+              for name, data in metadata.items()
+              if data.get("id_device")
+          ]
+          print(live[-1] if live else "")
+          PY
+          )"
+          echo "server_id=$live_id" >> "$GITHUB_OUTPUT"
+          export LIVE_SERVER="$live_id"
+          if [ "$install_status" -ne 0 ]; then
+            exit "$install_status"
+          fi
+          if [ -z "$live_id" ]; then
+            echo "::error::novavision install did not record a server id."
+            exit 1
+          fi
+          if [ ! -f "$HOME/.novavision/Server/$live_id/docker-compose.yml" ]; then
+            echo "::error::novavision install did not create a server compose file."
+            exit 1
+          fi
+          novavision start server --id "$live_id"
+          app_id="$(python - <<'PY'
+          import os
+          from pathlib import Path
+
+          server = Path.home() / ".novavision" / "Server" / os.environ["LIVE_SERVER"]
+          apps = [path.parent.name for path in server.glob("*/docker-compose.yml")]
+          print(apps[0] if apps else "")
+          PY
+          )"
+          if [ -z "$app_id" ]; then
+            echo "::error::install succeeded but no app compose file was found."
+            exit 1
+          fi
+          novavision start app --id "$app_id"
+          novavision stop app --id "$app_id"
+          novavision stop server --id "$live_id" --close-apps
+
+      - name: Remove CI device
+        if: ${{ always() && steps.live_install.outputs.server_id != '' }}
+        env:
+          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
+        run: |
+          set -euo pipefail
+          novavision uninstall server "$NOVAVISION_USER_TOKEN" \
+            --id "${{ steps.live_install.outputs.server_id }}"
 
   test-windows:
     name: test-windows
@@ -237,16 +310,12 @@ jobs:
         run: |
           python -m pytest tests -m "not integration" --tb=short -q
 
-  build-matrix:
-    name: build-matrix (${{ matrix.os }})
+  build:
+    name: build
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -264,12 +333,12 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.os }}
+          name: dist
           path: dist/
 
   ci:
     name: ci
-    needs: [changes, test-linux, test-windows, test-macos, build-matrix]
+    needs: [changes, test-linux, test-linux-live, test-windows, test-macos, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -278,12 +347,14 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           RUN_CI: ${{ needs.changes.outputs.run_ci }}
           LINUX: ${{ needs.test-linux.result }}
+          LIVE: ${{ needs.test-linux-live.result }}
           WINDOWS: ${{ needs.test-windows.result }}
           MACOS: ${{ needs.test-macos.result }}
-          BUILD: ${{ needs.build-matrix.result }}
+          BUILD: ${{ needs.build.result }}
+          LIVE_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES run_ci=$RUN_CI linux=$LINUX windows=$WINDOWS macos=$MACOS build=$BUILD"
+          echo "changes=$CHANGES run_ci=$RUN_CI linux=$LINUX live=$LIVE live_required=$LIVE_REQUIRED windows=$WINDOWS macos=$MACOS build=$BUILD"
           if [ "$CHANGES" != "success" ]; then
             exit 1
           fi
@@ -296,3 +367,8 @@ jobs:
               exit 1
             fi
           done
+          if [ "$LIVE_REQUIRED" = "true" ]; then
+            if [ "$LIVE" != "success" ]; then
+              exit 1
+            fi
+          fi

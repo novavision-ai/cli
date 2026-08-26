@@ -55,3 +55,43 @@ def test_prepare_local_device_data(fake_logger, nv_home):
     assert data["device_type"] == Installer.DEVICE_TYPE_LOCAL
     assert data["os_api_port"] == "7001"
     assert data["name"] == "ci-runner"
+
+
+def test_select_port_uses_explicit_value(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    assert installer._select_port("7001") == "7001"
+    assert installer._select_port("99999") is None
+
+
+def test_select_port_defaults_when_non_interactive(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = True
+    assert installer._select_port() == "7001"
+
+
+def test_select_gpu_picks_first_when_non_interactive(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = True
+    device_info = {"gpu": ["GPU-A", "GPU-B"]}
+    installer._select_gpu(device_info)
+    assert device_info["gpu"] == "GPU-A"
+
+
+def test_uninstall_deletes_device_and_local_folder(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://alfa.suite.novavision.ai"}}',
+        encoding="utf-8",
+    )
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = True
+    with patch.object(installer, "_delete_device", return_value=True) as delete_device:
+        with patch.object(installer.docker, "close_server_apps", return_value=True):
+            with patch.object(installer.docker, "stop_server_folder", return_value=True):
+                assert installer.uninstall(token="ci-token", server_name="abcdef") is True
+    delete_device.assert_called_once_with(
+        42, "https://alfa.suite.novavision.ai", "ci-token"
+    )
+    assert not server_folder.exists()
+    assert "abcdef" not in installer._load_server_metadata()

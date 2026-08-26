@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import zipfile
 import requests
 import subprocess
@@ -19,6 +20,7 @@ class Installer:
         self.log = logger if logger else ConsoleLogger()
         self.docker = DockerManager(logger=self.log)
         self.agent_dir = self._create_agent()
+        self.non_interactive = False
 
     def _create_agent(self):
         agent_dir = Path.home() / ".novavision"
@@ -72,6 +74,10 @@ class Installer:
         # Birden fazla GPU varsa kullanıcıdan seçim yapmasını iste
         if isinstance(device_info['gpu'], list):
             if len(device_info['gpu']) > 1:
+                if self.non_interactive:
+                    device_info['gpu'] = device_info['gpu'][0]
+                    self.log.info(f"Non-interactive mode: using GPU {device_info['gpu']}")
+                    return
                 self.log.info("Multiple GPUs detected. Please select one GPU.")
                 for idx, gpu in enumerate(device_info['gpu']):
                     self.log.info(f"{idx + 1}. {gpu}")
@@ -119,54 +125,61 @@ class Installer:
         except requests.exceptions.RequestException as e:
             return e
 
-    def install(self, device_type, token, host, workspace):
-        # Host parametresini formatlama
+    def install(self, device_type, token, host, workspace, port=None, non_interactive=False):
+        self.non_interactive = bool(non_interactive)
         host = self.format_host(host)
-
-        # Ana dizine geçiş
         os.chdir(os.path.expanduser("~"))
 
-        # Docker durum sorgulama ve eski containerları durdurup silme
-        self.docker._check_docker_available()
+        if not self.docker._check_docker_available():
+            return False
         self.docker._cleanup_previous_docker_installations()
 
-        # Sistem bilgilerini alma
         device_info = get_system_info()
         if "error" in device_info:
             self.log.error(f"Error getting system info: {device_info['error']}")
-            return
+            return False
 
-        # Birden fazla GPU varsa istenilen GPU seçimi
         self._select_gpu(device_info)
 
-        # Workspace seçimi
         workspace_selection = self._get_workspace_id(host, token, workspace)
+        if not workspace_selection:
+            return False
 
-        if workspace_selection:
-            workspace_user_id, workspace_name = workspace_selection
-            self._set_workspace(host, token, workspace_user_id)
-        else:
-            return
+        workspace_user_id, workspace_name = workspace_selection
+        if not self._set_workspace(host, token, workspace_user_id):
+            return False
 
-        # Port seçimi
-        port = self._select_port()
-        if not port:
-            return
+        selected_port = self._select_port(port)
+        if not selected_port:
+            return False
 
-        # Device data hazırlama
-        device_data = self._prepare_device_data(device_type, device_info, port)
-
+        device_data = self._prepare_device_data(device_type, device_info, selected_port)
         if not device_data:
-            return
+            return False
 
-        # Device kaydı
         register_response = self._register_device(device_data, token, host, device_info)
         if register_response is None:
-            return
+            return False
 
-        # Server kurulumu
+        pending_key = str(register_response.get("id_device") or "pending")
+        self._save_server_metadata(Path(pending_key), register_response, host, workspace_name)
+
         server_folder = self._setup_server(register_response, host)
+        if not server_folder:
+            return False
+
+        if server_folder.name != pending_key:
+            metadata = self._load_server_metadata()
+            if pending_key in metadata:
+                metadata[server_folder.name] = metadata.pop(pending_key)
+                try:
+                    with open(self._metadata_path(), "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, indent=2)
+                except Exception as e:
+                    self.log.warning(f"Could not update server metadata key: {e}")
+
         self._save_server_metadata(server_folder, register_response, host, workspace_name)
+        return True
 
     def _get_workspace_id(self, host, token, workspace):
         # Host ve endpoint ayarlama
@@ -217,6 +230,10 @@ class Installer:
                 workspace_name = workspace_list[0].get("workspace", {}).get("name", "Unknown")
                 return workspace_user_id, workspace_name
 
+            if self.non_interactive:
+                self.log.error("Multiple workspaces found. Pass --workspace in non-interactive mode.")
+                return None
+
             self.log.info("There are multiple workspaces available for user. Current workspaces available:")
             for idx, workspaces in enumerate(workspace_list):
                 workspace_info = workspaces.get('workspace', {})
@@ -250,7 +267,7 @@ class Installer:
     def _set_workspace(self, host, token, workspace_user_id):
         if workspace_user_id is None:
             self.log.error("Workspace user_id not found.")
-            return None
+            return False
 
         set_workspace_endpoint = f"{host}api/workspace/user/{workspace_user_id}"
         workspace_data = {"status": 1}
@@ -265,14 +282,26 @@ class Installer:
         try:
             if set_workspace_response.status_code == 200:
                 self.log.success("Workspace set successfully!")
+                return True
             else:
                 self.log.error(f"Workspace set failed! Error: {set_workspace_response.text}")
-                return
+                return False
         except Exception as e:
             self.log.error(f"Error occurred while setting workspace: {e}")
-            return
+            return False
 
-    def _select_port(self):
+    def _select_port(self, port=None):
+        if port is not None:
+            port_str = str(port).strip()
+            if port_str.isdigit() and 1 <= int(port_str) <= 65535:
+                return port_str
+            self.log.error("Port must be a number between 1 and 65535.")
+            return None
+
+        if self.non_interactive:
+            self.log.info("Non-interactive mode: using default port 7001.")
+            return "7001"
+
         while True:
             user_port = self.log.question("Default port is 7001. Would you like to use it? (y/n)").strip().lower()
             if user_port == "y":
@@ -311,12 +340,15 @@ class Installer:
                 response = requests.get("https://api.ipify.org?format=text")
                 wan_host = response.text
                 self.log.info(f"Detected WAN HOST: {wan_host}")
-                user_wan_ip = self.log.question("Would you like to use detected WAN HOST? (y/n)").strip().lower()
+                if self.non_interactive:
+                    self.log.info("Non-interactive mode: using detected WAN HOST.")
+                else:
+                    user_wan_ip = self.log.question("Would you like to use detected WAN HOST? (y/n)").strip().lower()
 
-                if user_wan_ip == "n":
-                    wan_host = self.log.question("Enter WAN HOST").strip()
-                elif user_wan_ip != "y":
-                    self.log.warning("Invalid input. Using detected WAN HOST...")
+                    if user_wan_ip == "n":
+                        wan_host = self.log.question("Enter WAN HOST").strip()
+                    elif user_wan_ip != "y":
+                        self.log.warning("Invalid input. Using detected WAN HOST...")
 
                 base_data.update({
                     "device_type": self.DEVICE_TYPE_CLOUD,
@@ -420,6 +452,11 @@ class Installer:
 
                             elif error_code == 1:
                                 self.log.warning("User exceeds the maximum limit of device! Device removal is needed.")
+                                if self.non_interactive:
+                                    self.log.error(
+                                        "Device limit reached. Uninstall an existing device, then retry."
+                                    )
+                                    return None
 
                                 self.log.info("Current devices:")
                                 for idx, device in enumerate(device_response):
@@ -465,12 +502,74 @@ class Installer:
                 auth_token=token
             )
 
-        if delete_response and delete_response.status_code == 204:
-            self.log.success("Old device removed successfully.")
-            return True
-        else:
+        if delete_response is None or isinstance(
+            delete_response, requests.exceptions.RequestException
+        ):
             self.log.error("Device removal failed!")
             return False
+        if delete_response.status_code in (200, 204, 404):
+            self.log.success("Device removed successfully.")
+            return True
+
+        self.log.error(
+            f"Device removal failed! Status: {delete_response.status_code} "
+            f"{getattr(delete_response, 'text', '')}"
+        )
+        return False
+
+    def uninstall(self, token, server_name=None):
+        if not server_name:
+            if self.non_interactive:
+                self.log.error("Server id is required in non-interactive mode.")
+                return False
+            server_folder = self.docker.get_server_folder()
+            if not server_folder:
+                return False
+            server_name = server_folder.name
+
+        metadata = self._load_server_metadata()
+        folder_name = server_name
+        server_meta = metadata.get(server_name, {})
+        if not server_meta:
+            for name, data in metadata.items():
+                if str(data.get("id_device")) == str(server_name):
+                    folder_name = name
+                    server_meta = data
+                    break
+
+        server_folder = Path.home() / ".novavision" / "Server" / folder_name
+        if server_folder.is_dir():
+            self.docker.close_server_apps(server_folder)
+            self.docker.stop_server_folder(server_folder)
+
+        id_device = server_meta.get("id_device")
+        host = server_meta.get("host")
+        if id_device and host:
+            if not self._delete_device(id_device, host, token):
+                return False
+        elif id_device:
+            self.log.error("Host is missing from server metadata; cannot delete device.")
+            return False
+        else:
+            self.log.warning("No device id in metadata; skipping remote device delete.")
+
+        if server_folder.is_dir():
+            try:
+                shutil.rmtree(server_folder)
+                self.log.success(f"Removed local server folder {server_folder.name}.")
+            except Exception as e:
+                self.log.error(f"Could not remove local server folder: {e}")
+                return False
+
+        if folder_name in metadata:
+            metadata.pop(folder_name, None)
+            try:
+                with open(self._metadata_path(), "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2)
+            except Exception as e:
+                self.log.warning(f"Could not update server metadata: {e}")
+
+        return True
 
     def _setup_server(self, register_response, host):
         host = self.format_host(host)

@@ -28,6 +28,7 @@ class NovaVisionCLI:
         subparsers.required = True
 
         self._add_install_parser(subparsers)
+        self._add_uninstall_parser(subparsers)
         self._add_start_parser(subparsers)
         self._add_stop_parser(subparsers)
         self._add_service_parser(subparsers)
@@ -48,20 +49,54 @@ class NovaVisionCLI:
             "--host", default="https://suite.novavision.ai", help="Host Url"
         )
         install_parser.add_argument("--workspace", default=None, help="Workspace Name")
+        install_parser.add_argument(
+            "--port",
+            default=None,
+            help="Server API port. Skips the port prompt when set.",
+        )
+        install_parser.add_argument(
+            "--non-interactive",
+            action="store_true",
+            help="Skip prompts. Requires --workspace. Defaults to port 7001 if --port is omitted.",
+        )
+
+    def _add_uninstall_parser(self, subparsers):
+        uninstall_parser = subparsers.add_parser(
+            "uninstall", help="Removes a local server and its registered device"
+        )
+        uninstall_parser.add_argument(
+            "type",
+            choices=["server"],
+            help="Type of resource to uninstall",
+        )
+        uninstall_parser.add_argument(
+            "token", help="User Authentication Token used to delete the device"
+        )
+        uninstall_parser.add_argument(
+            "--id", help="Server folder ID or device ID", required=True
+        )
 
     def _add_start_parser(self, subparsers):
         start_parser = subparsers.add_parser("start", help="Starts server | app")
         start_parser.add_argument(
             "type", choices=["server", "app"], help="Type of service to start"
         )
-        start_parser.add_argument("--id", help="AppID for App Choice", required=False)
+        start_parser.add_argument(
+            "--id",
+            help="Server folder ID, or App ID when starting an app",
+            required=False,
+        )
 
     def _add_stop_parser(self, subparsers):
         stop_parser = subparsers.add_parser("stop", help="Stops server | app")
         stop_parser.add_argument(
             "type", choices=["server", "app"], help="Type of service to stop"
         )
-        stop_parser.add_argument("--id", help="AppID for App Choice", required=False)
+        stop_parser.add_argument(
+            "--id",
+            help="Server folder ID, or App ID when stopping an app",
+            required=False,
+        )
         stop_parser.add_argument(
             "--close-apps",
             action="store_true",
@@ -104,12 +139,32 @@ class NovaVisionCLI:
         install_logger = ConsoleLogger(log_file_path=str(log_file))
         install_logger.info(f"Logging installation to {log_file}")
         self.installer = Installer(logger=install_logger)
-        self.installer.install(
+        if args.non_interactive and not args.workspace:
+            logger.error("--non-interactive requires --workspace.")
+            raise SystemExit(1)
+
+        success = self.installer.install(
             device_type=args.device_type,
             token=args.token,
             host=args.host,
             workspace=args.workspace,
+            port=args.port,
+            non_interactive=args.non_interactive,
         )
+        if not success:
+            raise SystemExit(1)
+
+    def handle_uninstall(self, args):
+        log_dir = Path.home() / ".novavision"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"uninstall-{datetime.now().strftime('%Y-%m-%d_%H-%M')}.log"
+        uninstall_logger = ConsoleLogger(log_file_path=str(log_file))
+        uninstall_logger.info(f"Logging uninstall to {log_file}")
+        self.installer = Installer(logger=uninstall_logger)
+        self.installer.non_interactive = True
+        success = self.installer.uninstall(token=args.token, server_name=args.id)
+        if not success:
+            raise SystemExit(1)
 
     def handle_docker_command(self, args):
         if (
@@ -118,17 +173,25 @@ class NovaVisionCLI:
             and args.type != "server"
         ):
             logger.error("--close-apps can only be used with stop server.")
-            return
+            raise SystemExit(1)
 
-        if (args.type == "app" and args.id) or args.type == "server":
-            self.docker.manage_docker(
+        if args.type == "app" and not args.id:
+            logger.error("--id is required when starting or stopping an app.")
+            raise SystemExit(1)
+
+        if args.type in ["server", "app"]:
+            success = self.docker.manage_docker(
                 command=args.command,
                 type=args.type,
                 app_name=args.id if args.type == "app" else None,
                 close_apps=getattr(args, "close_apps", False),
+                server_name=args.id if args.type == "server" else None,
             )
+            if not success:
+                raise SystemExit(1)
         else:
             logger.error("Invalid arguments!")
+            raise SystemExit(1)
 
     def handle_service_command(self, args):
         if args.type != "server":
@@ -171,14 +234,19 @@ class NovaVisionCLI:
         try:
             if args.command == "install":
                 self.handle_install(args)
+            elif args.command == "uninstall":
+                self.handle_uninstall(args)
             elif args.command in ["start", "stop"]:
                 self.handle_docker_command(args)
             elif args.command == "service":
                 self.handle_service_command(args)
             else:
                 logger.error(f"Unknown command: {args.command}")
+        except SystemExit:
+            raise
         except Exception as e:
             logger.error(f"An error occurred: {str(e)}")
+            raise SystemExit(1)
 
 
 def main():

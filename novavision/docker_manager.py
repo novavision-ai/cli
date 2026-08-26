@@ -226,13 +226,16 @@ class DockerManager:
             return None
 
     def manage_docker(
-        self, command, type, app_name=None, select_server=True, close_apps=False
+        self, command, type, app_name=None, select_server=True, close_apps=False,
+        server_name=None,
     ):
         default_path = Path.home() / ".novavision"
         server_path = default_path / "Server"
 
         if command == "start":
             if type == "server":
+                if server_name:
+                    return self.start_server_folder(self.get_server_folder(server_name))
                 server_folder = (
                     self.choose_server_folder(server_path) if select_server else None
                 )
@@ -240,6 +243,7 @@ class DockerManager:
                     server_folders = [
                         item for item in server_path.iterdir() if item.is_dir()
                     ]
+                    started = True
                     for folder in server_folders:
                         docker_compose_file = folder / "docker-compose.yml"
                         if docker_compose_file.exists():
@@ -249,19 +253,26 @@ class DockerManager:
                                 self.log.error(
                                     f"Error starting server {folder.name}: {e}"
                                 )
-                else:
-                    server_folder = server_folder or self.choose_server_folder(
-                        server_path
-                    )
-                    self.start_server_folder(server_folder)
+                                started = False
+                    return started
+                server_folder = server_folder or self.choose_server_folder(
+                    server_path
+                )
+                return self.start_server_folder(server_folder)
             elif type == "app":
-                self._start_app(app_name)
+                return self._start_app(app_name)
 
         elif command == "stop":
             if type == "server":
-                self._stop_server(server_path, select_server, close_apps=close_apps)
+                return self._stop_server(
+                    server_path,
+                    select_server,
+                    close_apps=close_apps,
+                    server_name=server_name,
+                )
             elif type == "app":
-                self._stop_app(app_name)
+                return self._stop_app(app_name)
+        return False
 
     def _docker_compose_command(self):
         if shutil.which("docker"):
@@ -491,25 +502,42 @@ class DockerManager:
             self.log.error(f"Error stopping server apps: {e}")
             return False
 
-    def _stop_server(self, server_path, select_server=True, close_apps=False):
+    def _stop_server(
+        self, server_path, select_server=True, close_apps=False, server_name=None
+    ):
+        if server_name:
+            server_folder = self.get_server_folder(server_name)
+            if close_apps:
+                self.close_server_apps(server_folder)
+            return self.stop_server_folder(server_folder)
+
         if select_server:
             server_folder = self.choose_server_folder(server_path)
             if close_apps:
                 self.close_server_apps(server_folder)
-            self.stop_server_folder(server_folder)
-        else:
-            server_folders = [item for item in server_path.iterdir() if item.is_dir()]
-            for folder in server_folders:
-                docker_compose_file = folder / "docker-compose.yml"
-                if docker_compose_file.exists():
-                    if close_apps:
-                        self.close_server_apps(folder)
+            return self.stop_server_folder(server_folder)
+
+        if not server_path.is_dir():
+            return False
+
+        stopped = True
+        server_folders = [item for item in server_path.iterdir() if item.is_dir()]
+        for folder in server_folders:
+            docker_compose_file = folder / "docker-compose.yml"
+            if docker_compose_file.exists():
+                if close_apps:
+                    self.close_server_apps(folder)
+                try:
                     self.run_docker_compose(docker_compose_file, "down", "--volumes")
                     self.log.success(f"Server {folder.name} stopped.")
                     if self.remove_network():
                         self.log.success(
                             f"Server {folder.name} network removed successfully."
                         )
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    self.log.error(f"Error stopping server {folder.name}: {e}")
+                    stopped = False
+        return stopped
 
     def _stop_app(self, app_name):
         compose_file = self._require_running_server_for_app(app_name)
