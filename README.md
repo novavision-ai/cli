@@ -36,7 +36,7 @@ novavision install [edge|local|cloud] <USER_TOKEN> --host <HOST> --workspace <US
 **Parameters**  
 - `DEVICE_TYPE`: Specifies the server type. Options: `edge`, `local`, or `cloud`.  
 - `USER_TOKEN`: User token required for registering and installing the server.
-- `--host`: User can specify which host will be used for creating device. Default: `alfa.suite.novavision.ai`. Choices: `alfa.suite.novavision.ai | dev.suite.novavision.ai | suite.novavision.ai`
+- `--host`: User can specify which host will be used for creating device. Default: `alfa.suite.novavision.ai`. Choices: `alfa.suite.novavision.ai | suite.novavision.ai`
 - `--workspace`: User can specify which workspace will be used for creating device. User must type the name of the workspace they have. If this parameter is not entered, workspace selection will be performed while device creation. 
 
 ---
@@ -51,6 +51,8 @@ novavision start [server|app] --id <APP_ID>
 **Parameters**  
 - `--id <APP_ID>` *(Optional, required only for apps)*: Specifies which application to start.
 
+The parent server must be running before starting an app.
+
 ---
 
 ### **stop**  
@@ -62,3 +64,21 @@ novavision stop [server|app] --id <APP_ID>
 
 **Parameters**  
 - `--id <APP_ID>` *(Optional, required only for apps)*: Specifies which application to stop.
+- `--close-apps`: When stopping a server, also stop apps belonging to that server.
+
+The parent server must be running before stopping an app.
+
+---
+
+### **service**  
+Enables, disables, or shows status for automatic server startup.
+
+```bash
+novavision service [enable|disable|status] server --id <SERVER_ID> --apps <APP_ID>
+```
+
+**Parameters**  
+- `--id <SERVER_ID>` *(Optional)*: Specifies which server to manage. If omitted, you will be asked to select one.
+- `--apps` *(Optional, enable only)*: App IDs to start after the server. Use `"*"` to start all apps.
+
+Linux requires sudo. Windows requires an Administrator terminal. On macOS and Windows, Docker Desktop must start automatically.
