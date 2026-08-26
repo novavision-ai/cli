@@ -12,13 +12,47 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   PYTHON_VERSION: "3.11"
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.decide.outputs.run_ci }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect test-relevant changes
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            run_ci:
+              - "novavision/**"
+              - "tests/**"
+              - "setup.py"
+              - "pyproject.toml"
+              - ".github/workflows/**"
+
+      - name: Decide whether to run tests
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_ci=${{ steps.filter.outputs.run_ci }}" >> "$GITHUB_OUTPUT"
+          fi
+
   test-linux:
     name: test-linux
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -137,6 +171,8 @@ jobs:
 
   test-windows:
     name: test-windows
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -169,6 +205,8 @@ jobs:
 
   test-macos:
     name: test-macos
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -197,6 +235,8 @@ jobs:
 
   build-matrix:
     name: build-matrix (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -222,3 +262,33 @@ jobs:
         with:
           name: dist-${{ matrix.os }}
           path: dist/
+
+  ci:
+    name: ci
+    needs: [changes, test-linux, test-windows, test-macos, build-matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN_CI: ${{ needs.changes.outputs.run_ci }}
+          LINUX: ${{ needs.test-linux.result }}
+          WINDOWS: ${{ needs.test-windows.result }}
+          MACOS: ${{ needs.test-macos.result }}
+          BUILD: ${{ needs.build-matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "changes=$CHANGES run_ci=$RUN_CI linux=$LINUX windows=$WINDOWS macos=$MACOS build=$BUILD"
+          if [ "$CHANGES" != "success" ]; then
+            exit 1
+          fi
+          if [ "$RUN_CI" != "true" ]; then
+            echo "No test-relevant files changed; OS jobs were skipped."
+            exit 0
+          fi
+          for result in "$LINUX" "$WINDOWS" "$MACOS" "$BUILD"; do
+            if [ "$result" != "success" ]; then
+              exit 1
+            fi
+          done
