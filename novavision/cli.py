@@ -10,6 +10,7 @@ from novavision.service_manager import ServiceManager
 
 logger = ConsoleLogger()
 
+
 class NovaVisionCLI:
     def __init__(self):
         self.docker = DockerManager(logger=logger)
@@ -18,14 +19,10 @@ class NovaVisionCLI:
 
     def create_parser(self):
         parser = argparse.ArgumentParser(
-            prog="novavision",
-            description="NovaVision CLI Tool"
+            prog="novavision", description="NovaVision CLI Tool"
         )
         parser.add_argument(
-            "-v",
-            "--version",
-            action="version",
-            version=f"%(prog)s {__version__}"
+            "-v", "--version", action="version", version=f"%(prog)s {__version__}"
         )
         subparsers = parser.add_subparsers(dest="command", help="Available commands")
         subparsers.required = True
@@ -39,57 +36,32 @@ class NovaVisionCLI:
 
     def _add_install_parser(self, subparsers):
         install_parser = subparsers.add_parser(
-            "install",
-            help="Creates device and installs server")
+            "install", help="Creates device and installs server"
+        )
         install_parser.add_argument(
             "device_type",
             choices=["edge", "local", "cloud"],
-            help="Select and Configure Device Type"
+            help="Select and Configure Device Type",
         )
+        install_parser.add_argument("token", help="User Authentication Token")
         install_parser.add_argument(
-            "token",
-            help="User Authentication Token"
+            "--host", default="https://suite.novavision.ai", help="Host Url"
         )
-        install_parser.add_argument(
-            "--host",
-            default="https://suite.novavision.ai",
-            help="Host Url"
-        )
-        install_parser.add_argument(
-            "--workspace",
-            default=None,
-            help="Workspace Name"
-        )
+        install_parser.add_argument("--workspace", default=None, help="Workspace Name")
 
     def _add_start_parser(self, subparsers):
-        start_parser = subparsers.add_parser(
-            "start",
-            help="Starts server | app")
+        start_parser = subparsers.add_parser("start", help="Starts server | app")
         start_parser.add_argument(
-            "type",
-            choices=["server", "app"],
-            help="Type of service to start"
+            "type", choices=["server", "app"], help="Type of service to start"
         )
-        start_parser.add_argument(
-            "--id",
-            help="AppID for App Choice",
-            required=False
-        )
+        start_parser.add_argument("--id", help="AppID for App Choice", required=False)
 
     def _add_stop_parser(self, subparsers):
-        stop_parser = subparsers.add_parser(
-            "stop",
-            help="Stops server | app")
+        stop_parser = subparsers.add_parser("stop", help="Stops server | app")
         stop_parser.add_argument(
-            "type",
-            choices=["server", "app"],
-            help="Type of service to stop"
+            "type", choices=["server", "app"], help="Type of service to stop"
         )
-        stop_parser.add_argument(
-            "--id",
-            help="AppID for App Choice",
-            required=False
-        )
+        stop_parser.add_argument("--id", help="AppID for App Choice", required=False)
         stop_parser.add_argument(
             "--close-apps",
             action="store_true",
@@ -98,38 +70,31 @@ class NovaVisionCLI:
 
     def _add_service_parser(self, subparsers):
         service_parser = subparsers.add_parser(
-            "service",
-            help="Manages server service integration")
-        service_parser.add_argument(
-            "action",
-            choices=["enable", "disable", "status"],
-            help="Service action"
+            "service", help="Manages server service integration"
         )
         service_parser.add_argument(
-            "type",
-            choices=["server"],
-            help="Type of service to manage"
+            "action", choices=["enable", "disable", "status"], help="Service action"
         )
         service_parser.add_argument(
-            "--id",
-            help="Server folder ID",
-            required=False
+            "type", choices=["server"], help="Type of service to manage"
+        )
+        service_parser.add_argument("--id", help="Server folder ID", required=False)
+        service_parser.add_argument(
+            "--apps",
+            nargs="+",
+            metavar="APP_ID",
+            help='App IDs to start with the server service. Use "*" for all apps.',
+            required=False,
         )
 
     def _create_internal_service_parser(self):
         service_parser = argparse.ArgumentParser(
-            prog="novavision _service",
-            description=argparse.SUPPRESS)
-        service_parser.add_argument(
-            "action",
-            choices=["start-server", "stop-server"],
-            help=argparse.SUPPRESS
+            prog="novavision _service", description=argparse.SUPPRESS
         )
         service_parser.add_argument(
-            "--server",
-            required=True,
-            help=argparse.SUPPRESS
+            "action", choices=["start-server", "stop-server"], help=argparse.SUPPRESS
         )
+        service_parser.add_argument("--server", required=True, help=argparse.SUPPRESS)
         return service_parser
 
     def handle_install(self, args):
@@ -143,7 +108,7 @@ class NovaVisionCLI:
             device_type=args.device_type,
             token=args.token,
             host=args.host,
-            workspace=args.workspace
+            workspace=args.workspace,
         )
 
     def handle_docker_command(self, args):
@@ -171,7 +136,10 @@ class NovaVisionCLI:
             raise SystemExit(1)
 
         if args.action == "enable":
-            success = self.service.enable_server(server_name=args.id)
+            success = self.service.enable_server(
+                server_name=args.id,
+                apps=getattr(args, "apps", None),
+            )
         elif args.action == "disable":
             success = self.service.disable_server(server_name=args.id)
         elif args.action == "status":
@@ -185,8 +153,7 @@ class NovaVisionCLI:
 
     def handle_internal_service_command(self, args):
         success = self.service.run_service_action(
-            action=args.action,
-            server_name=args.server
+            action=args.action, server_name=args.server
         )
         if not success:
             raise SystemExit(1)

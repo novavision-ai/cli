@@ -19,7 +19,7 @@ class ServiceManager:
         self._apply_service_home()
         self.docker = docker_manager or DockerManager(logger=self.log)
 
-    def enable_server(self, server_name=None):
+    def enable_server(self, server_name=None, apps=None):
         server_folder = self.docker.get_server_folder(server_name)
         if not server_folder:
             return False
@@ -29,6 +29,15 @@ class ServiceManager:
 
         if not self._validate_docker_startup():
             return False
+
+        service_apps = self._normalize_service_apps(apps)
+        if service_apps and "*" not in service_apps:
+            available_apps = self.docker._server_app_compose_files(server_folder)
+            for app_name in service_apps:
+                if app_name not in available_apps:
+                    self.log.warning(
+                        f"App {app_name} was not found under server {server_folder.name}."
+                    )
 
         service_name = self._service_name(server_folder.name)
         result = self._enable_native_service(service_name, server_folder.name)
@@ -40,7 +49,12 @@ class ServiceManager:
             enabled=True,
             provider=result["provider"],
             service_name=service_name,
+            apps=service_apps,
         )
+        if service_apps == ["*"]:
+            self.log.info("Service will start all apps for this server.")
+        elif service_apps:
+            self.log.info("Service will start apps: " + ", ".join(service_apps))
         self.log.success(f"Service enabled for server {server_folder.name}.")
         return True
 
@@ -54,11 +68,18 @@ class ServiceManager:
         if not self._disable_native_service(service_name):
             return False
 
+        current_apps = (
+            self._load_metadata()
+            .get(server_folder.name, {})
+            .get("service", {})
+            .get("apps", [])
+        )
         self._update_service_metadata(
             server_folder.name,
             enabled=False,
             provider=provider,
             service_name=service_name,
+            apps=current_apps,
         )
         self.log.success(f"Service disabled for server {server_folder.name}.")
         return True
@@ -78,6 +99,13 @@ class ServiceManager:
         self.log.info(f"Service: {'enabled' if enabled else 'disabled'}")
         self.log.info(f"Provider: {service_metadata.get('provider', provider)}")
         self.log.info(f"Name: {service_metadata.get('name', service_name)}")
+        apps = service_metadata.get("apps") or []
+        if apps == ["*"]:
+            self.log.info("Apps: all")
+        elif apps:
+            self.log.info("Apps: " + ", ".join(apps))
+        else:
+            self.log.info("Apps: none")
         return self._status_native_service(service_name)
 
     def run_service_action(self, action, server_name):
@@ -88,7 +116,17 @@ class ServiceManager:
         if action == "start-server":
             if not self.docker.wait_for_docker():
                 return False
-            return self.docker.start_server_folder(server_folder)
+            if not self.docker.start_server_folder(server_folder):
+                return False
+            apps = (
+                self._load_metadata()
+                .get(server_name, {})
+                .get("service", {})
+                .get("apps")
+                or []
+            )
+            self.docker.start_server_apps(server_folder, apps)
+            return True
         if action == "stop-server":
             return self.docker.stop_server_folder(server_folder)
 
@@ -185,13 +223,30 @@ class ServiceManager:
             self.log.error(f"Could not save server metadata: {e}")
             return False
 
-    def _update_service_metadata(self, server_name, enabled, provider, service_name):
+    def _normalize_service_apps(self, apps):
+        if not apps:
+            return []
+
+        normalized = []
+        for app_name in apps:
+            name = str(app_name).strip()
+            if not name or name in normalized:
+                continue
+            if name == "*":
+                return ["*"]
+            normalized.append(name)
+        return normalized
+
+    def _update_service_metadata(
+        self, server_name, enabled, provider, service_name, apps=None
+    ):
         metadata = self._load_metadata()
         server_metadata = metadata.setdefault(server_name, {})
         server_metadata["service"] = {
             "enabled": enabled,
             "provider": provider,
             "name": service_name,
+            "apps": apps or [],
         }
         self._save_metadata(metadata)
 
@@ -273,7 +328,8 @@ exit /B %ERRORLEVEL%
     def _write_windows_task_launcher(self, script_path):
         launcher_path = script_path.with_suffix(".vbs")
         launcher_content = f"""Set shell = CreateObject("WScript.Shell")
-command = Chr(34) & "{script_path}" & Chr(34)
+comspec = shell.ExpandEnvironmentStrings("%ComSpec%")
+command = Chr(34) & comspec & Chr(34) & " /D /C " & Chr(34) & "{script_path}" & Chr(34)
 shell.Run command, 0, False
 """
 
@@ -286,7 +342,7 @@ shell.Run command, 0, False
         script_path = self._write_windows_task_script(action, server_name)
         launcher_path = self._write_windows_task_launcher(script_path)
         wscript = shutil.which("wscript.exe") or "wscript.exe"
-        return subprocess.list2cmdline([wscript, str(launcher_path)])
+        return subprocess.list2cmdline([wscript, "//B", str(launcher_path)])
 
     def _run_command(self, args, log_error=True):
         try:

@@ -254,6 +254,8 @@ class DockerManager:
                         server_path
                     )
                     self.start_server_folder(server_folder)
+            elif type == "app":
+                self._start_app(app_name)
 
         elif command == "stop":
             if type == "server":
@@ -301,13 +303,13 @@ class DockerManager:
         )
         return False
 
-    def _start_server(self, docker_compose_file):
+    def _start_server(self, docker_compose_file, label="server"):
         previous_containers = set(
             subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True)
             .stdout.strip()
             .split("\n")
         )
-        self.log.info("Starting server")
+        self.log.info(f"Starting {label}")
         try:
             self.run_docker_compose(docker_compose_file, "up", "-d")
             result = subprocess.run(
@@ -318,8 +320,111 @@ class DockerManager:
             self._display_new_containers(result.stdout, previous_containers)
             return True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            self.log.error(f"Error starting server: {e}")
+            self.log.error(f"Error starting {label}: {e}")
             return False
+
+    def _server_app_compose_files(self, server_folder):
+        if not server_folder:
+            return {}
+
+        server_compose = server_folder / "docker-compose.yml"
+        apps = {}
+        for compose_file in server_folder.rglob("docker-compose.yml"):
+            if compose_file.resolve() == server_compose.resolve():
+                continue
+            apps[compose_file.parent.name] = compose_file
+        return apps
+
+    def _find_app(self, app_name):
+        server_path = Path.home() / ".novavision" / "Server"
+        if not server_path.is_dir():
+            self.log.error("No server folder found.")
+            return None, None
+
+        matches = []
+        for folder in server_path.iterdir():
+            if not folder.is_dir():
+                continue
+            apps = self._server_app_compose_files(folder)
+            if app_name in apps:
+                matches.append((folder, apps[app_name]))
+
+        if not matches:
+            self.log.error(f"App folder not found: {app_name}")
+            return None, None
+        if len(matches) > 1:
+            servers = ", ".join(folder.name for folder, _ in matches)
+            self.log.warning(
+                f"App {app_name} was found on multiple servers ({servers}). "
+                f"Using server {matches[0][0].name}."
+            )
+        return matches[0]
+
+    def _server_is_running(self, server_folder):
+        if not server_folder:
+            return False
+
+        compose_file = server_folder / "docker-compose.yml"
+        compose_command = self._docker_compose_command()
+        if not compose_command or not compose_file.exists():
+            return False
+
+        result = subprocess.run(
+            compose_command + ["-f", str(compose_file), "ps", "-q"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        return any(line.strip() for line in result.stdout.splitlines())
+
+    def _require_running_server_for_app(self, app_name):
+        server_folder, compose_file = self._find_app(app_name)
+        if not compose_file:
+            return None
+
+        if not self._server_is_running(server_folder):
+            self.log.error(
+                f"Server {server_folder.name} is not running. "
+                f"Start the server before starting or stopping app {app_name}."
+            )
+            return None
+        return compose_file
+
+    def start_server_apps(self, server_folder, app_names=None):
+        if not app_names:
+            return True
+
+        apps = self._server_app_compose_files(server_folder)
+        if not apps:
+            self.log.info("No apps found for this server.")
+            return True
+
+        if "*" in app_names:
+            selected = apps
+        else:
+            selected = {}
+            for app_name in app_names:
+                if app_name in apps:
+                    selected[app_name] = apps[app_name]
+                else:
+                    self.log.warning(f"App not found for this server: {app_name}")
+
+        if not selected:
+            self.log.info("No matching apps to start.")
+            return True
+
+        started = True
+        for app_name, compose_file in selected.items():
+            if not self._start_server(compose_file, label=f"app {app_name}"):
+                started = False
+        return started
+
+    def _start_app(self, app_name):
+        compose_file = self._require_running_server_for_app(app_name)
+        if not compose_file:
+            return False
+        return self._start_server(compose_file, label=f"app {app_name}")
 
     def _compose_container_ids(self, compose_file):
         compose_command = self._docker_compose_command()
@@ -359,15 +464,12 @@ class DockerManager:
         stopped = []
 
         try:
-            nested_compose_files = [
-                compose_file
-                for compose_file in server_folder.rglob("docker-compose.yml")
-                if compose_file.resolve() != server_compose.resolve()
-            ]
-            for compose_file in nested_compose_files:
+            for app_name, compose_file in self._server_app_compose_files(
+                server_folder
+            ).items():
                 try:
                     self.run_docker_compose(compose_file, "stop")
-                    self.log.info(f"Stopped app compose: {compose_file.parent.name}")
+                    self.log.info(f"Stopped app compose: {app_name}")
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     self.log.warning(f"Could not stop app compose {compose_file}: {e}")
 
@@ -410,26 +512,17 @@ class DockerManager:
                         )
 
     def _stop_app(self, app_name):
-        with self.log.loading("Stopping App"):
-            try:
-                result = subprocess.run(
-                    ["docker", "ps", "--format", "{{.ID}} {{.Names}}"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                if result.returncode != 0:
-                    for line in result.stdout.strip().split("\n"):
-                        container_id, container_name = line.split(" ", 1)
-                        if app_name in container_name:
-                            subprocess.run(["docker", "stop", container_id], check=True)
+        compose_file = self._require_running_server_for_app(app_name)
+        if not compose_file:
+            return False
 
-            except subprocess.CalledProcessError as e:
-                self.log.error(f"Error stopping app: {e}")
-
-            if self.remove_network():
-                self.log.success("App network removed successfully.")
-            self.log.success("All apps deployed in server stopped successfully.")
+        try:
+            self.run_docker_compose(compose_file, "stop")
+            self.log.success(f"App {app_name} stopped.")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            self.log.error(f"Error stopping app {app_name}: {e}")
+            return False
 
     def _display_new_containers(self, output, previous_containers):
         current_containers = output.strip().split("\n")
