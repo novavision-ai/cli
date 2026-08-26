@@ -1,0 +1,224 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  test-linux:
+    name: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" \
+            --cov=novavision \
+            --cov-report=term \
+            --cov-report=xml \
+            --junitxml=unit-test-results.xml
+
+      - name: Docker Compose integration tests
+        run: python -m pytest tests -m integration -q
+
+      - name: Seed fixture server for CLI
+        run: |
+          mkdir -p "$HOME/.novavision/Server/ci-server/demo"
+          cp tests/fixtures/compose/docker-compose.yml "$HOME/.novavision/Server/ci-server/"
+          cp tests/fixtures/compose/demo/docker-compose.yml "$HOME/.novavision/Server/ci-server/demo/"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / ".novavision" / "servers.json"
+          meta.write_text(
+              json.dumps(
+                  {
+                      "ci-server": {
+                          "name": "ci-server",
+                          "workspace": "ci",
+                          "host": "https://alfa.suite.novavision.ai/",
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: CLI start/stop against real Docker
+        run: |
+          novavision start server
+          novavision start app --id demo
+          novavision stop app --id demo
+          novavision stop server --close-apps
+
+      - name: CLI service enable/status/disable
+        run: |
+          sudo systemctl enable docker
+          novavision_bin="$(command -v novavision)"
+          sudo "$novavision_bin" service enable server --id ci-server
+          sudo "$novavision_bin" service status server --id ci-server
+          sudo "$novavision_bin" service disable server --id ci-server
+
+      - name: Live install against NovaVision API
+        if: ${{ secrets.NOVAVISION_USER_TOKEN != '' && github.event_name != 'pull_request' }}
+        continue-on-error: true
+        env:
+          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
+          NOVAVISION_WORKSPACE: ${{ secrets.NOVAVISION_WORKSPACE || vars.NOVAVISION_WORKSPACE }}
+          NOVAVISION_HOST: ${{ secrets.NOVAVISION_HOST || vars.NOVAVISION_HOST || 'alfa.suite.novavision.ai' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
+            echo "NOVAVISION_WORKSPACE is not set; skipping live install."
+            exit 0
+          fi
+          printf 'y\n' | novavision install local "$NOVAVISION_USER_TOKEN" \
+            --host "$NOVAVISION_HOST" \
+            --workspace "$NOVAVISION_WORKSPACE"
+          novavision start server
+          app_id="$(python - <<'PY'
+          from pathlib import Path
+
+          root = Path.home() / ".novavision" / "Server"
+          apps = [path.parent.name for path in root.glob("*/*/docker-compose.yml")]
+          print(apps[0] if apps else "")
+          PY
+          )"
+          if [ -n "$app_id" ]; then
+            novavision start app --id "$app_id"
+            novavision stop app --id "$app_id"
+          fi
+          novavision stop server --close-apps
+
+      - name: Upload coverage and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-logs
+          if-no-files-found: ignore
+          path: |
+            coverage.xml
+            unit-test-results.xml
+            ${{ github.workspace }}/.coverage
+            /home/runner/.novavision/**/*.log
+
+  test-windows:
+    name: test-windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" --tb=short -q
+
+      - name: Docker daemon (best-effort, non-blocking)
+        continue-on-error: true
+        run: docker info
+
+  test-macos:
+    name: test-macos
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" --tb=short -q
+
+  build-matrix:
+    name: build-matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/

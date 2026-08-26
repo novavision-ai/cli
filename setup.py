@@ -8,7 +8,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name='novavision-cli',
     version=__version__,
-    packages=find_packages(),
+    packages=find_packages(exclude=["tests", "tests.*"]),
     include_package_data=True,
     install_requires=["requests==2.32.3",
                       "psutil==6.1.1",
@@ -16,7 +16,13 @@ setup(
                       "rich==13.9.4",
                       "pyyaml==6.0.2"],
     extras_require={
-        ":sys_platform=='darwin'": ["pyobjc"]},
+        ":sys_platform=='darwin'": ["pyobjc"],
+        "test": [
+            "pytest>=7.4",
+            "pytest-cov>=4.1",
+            "ruff>=0.6",
+        ],
+    },
     entry_points={
         'console_scripts': ['novavision=novavision.cli:main'],
     },
