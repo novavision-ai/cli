@@ -79,3 +79,37 @@ def test_normalize_service_apps(fake_logger, nv_home):
     assert service._normalize_service_apps(None) == []
     assert service._normalize_service_apps(["demo", "demo", " other "]) == ["demo", "other"]
     assert service._normalize_service_apps(["demo", "*"]) == ["*"]
+
+
+def test_docker_desktop_startup_skips_prompt_when_not_tty(fake_logger, nv_home, monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("novavision.service_manager.sys.stdin", Mock(isatty=lambda: False))
+    service = ServiceManager(logger=fake_logger)
+    assert service._confirm_docker_desktop_startup("Windows") is True
+    assert not fake_logger.messages_of("question")
+
+
+def test_docker_desktop_startup_skips_prompt_in_ci(fake_logger, nv_home, monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setattr("novavision.service_manager.sys.stdin", Mock(isatty=lambda: True))
+    service = ServiceManager(logger=fake_logger)
+    assert service._confirm_docker_desktop_startup("Windows") is True
+    assert not fake_logger.messages_of("question")
+
+
+def test_docker_desktop_startup_asks_when_tty(fake_logger, nv_home, monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("novavision.service_manager.sys.stdin", Mock(isatty=lambda: True))
+    fake_logger.answers = ["y"]
+    service = ServiceManager(logger=fake_logger)
+    assert service._confirm_docker_desktop_startup("Windows") is True
+    assert fake_logger.messages_of("question")
+
+
+def test_docker_desktop_startup_rejects_when_not_enabled(fake_logger, nv_home, monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("novavision.service_manager.sys.stdin", Mock(isatty=lambda: True))
+    fake_logger.answers = ["n"]
+    service = ServiceManager(logger=fake_logger)
+    assert service._confirm_docker_desktop_startup("Windows") is False
+    assert any("Docker Desktop" in message for message in fake_logger.messages_of("error"))

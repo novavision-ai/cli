@@ -14,7 +14,7 @@ Install NovaVision CLI with pip:
 pip install novavision-cli
 
 # Verify installation
-novavision --help
+novavision --version
 ```
 
 pipx is optional. Use it if you want the CLI in an isolated environment:
@@ -57,7 +57,7 @@ novavision uninstall server <USER_TOKEN> --id <SERVER_ID>
 
 ---
 
-### **novavision start**  
+### **start**  
 Launches the server's or application's Docker Compose environment, starting the server or application if it isn’t already running.
 
 ```bash

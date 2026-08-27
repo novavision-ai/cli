@@ -1,6 +1,5 @@
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -21,10 +20,24 @@ def _docker_ready():
     return result.returncode == 0
 
 
+def _linux_containers():
+    if not _docker_ready():
+        return False
+    result = subprocess.run(
+        ["docker", "info", "--format", "{{.OSType}}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip().lower() == "linux"
+
+
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(sys.platform != "linux", reason="Live Compose coverage runs on Linux CI"),
     pytest.mark.skipif(not _docker_ready(), reason="Docker daemon is not available"),
+    pytest.mark.skipif(
+        not _linux_containers(),
+        reason="Linux containers are not available",
+    ),
 ]
 
 

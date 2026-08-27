@@ -432,6 +432,14 @@ shell.Run command, 0, False
             return False
         return True
 
+    def _is_noninteractive(self):
+        if os.environ.get("CI"):
+            return True
+        try:
+            return not sys.stdin.isatty()
+        except Exception:
+            return True
+
     def _validate_docker_startup(self):
         if not shutil.which("docker"):
             self.log.error("Docker is not installed. Please install Docker first.")
@@ -458,6 +466,13 @@ shell.Run command, 0, False
 
     def _confirm_docker_desktop_startup(self, system):
         os_name = "macOS" if system == "Darwin" else "Windows"
+        if self._is_noninteractive():
+            self.log.info(
+                f"Assuming Docker Desktop starts automatically on {os_name} "
+                "(non-interactive session)."
+            )
+            return True
+
         answer = (
             self.log.question(
                 f"Docker Desktop must be configured to start automatically on {os_name}. "

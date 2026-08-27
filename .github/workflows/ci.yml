@@ -251,7 +251,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -276,16 +276,110 @@ jobs:
         run: |
           python -m pytest tests -m "not integration" --tb=short -q
 
-      - name: Docker daemon (best-effort, non-blocking)
-        continue-on-error: true
-        run: docker info
+      - name: Ensure Docker daemon is running
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          try {
+            Start-Service docker
+          } catch {
+            Write-Host "Start-Service docker: $_"
+          }
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            docker info *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $ok = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) {
+            docker info
+            throw "Docker daemon did not become ready."
+          }
+          $ostype = (docker info --format '{{.OSType}}').Trim()
+          Write-Host "Docker OSType: $ostype"
+          if ($ostype -ne 'linux') {
+            docker info
+            throw "Windows CI needs Linux containers to run the same Compose fixtures as Linux. OSType=$ostype"
+          }
+
+      - name: Docker Compose integration tests
+        run: python -m pytest tests -m integration -q
+
+      - name: Seed fixture server for CLI
+        shell: pwsh
+        run: |
+          $server = Join-Path $env:USERPROFILE ".novavision\Server\ci-server"
+          $demo = Join-Path $server "demo"
+          New-Item -ItemType Directory -Force -Path $demo | Out-Null
+          Copy-Item "tests\fixtures\compose\docker-compose.yml" $server
+          Copy-Item "tests\fixtures\compose\demo\docker-compose.yml" $demo
+          python -c @"
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / '.novavision' / 'servers.json'
+          meta.parent.mkdir(parents=True, exist_ok=True)
+          meta.write_text(
+              json.dumps(
+                  {
+                      'ci-server': {
+                          'name': 'ci-server',
+                          'workspace': 'ci',
+                          'host': 'https://alfa.suite.novavision.ai/',
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding='utf-8',
+          )
+          "@
+
+      - name: CLI start/stop against real Docker
+        shell: pwsh
+        run: |
+          novavision start server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision start app --id demo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision stop app --id demo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision stop server --close-apps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: CLI service enable/status/disable
+        shell: pwsh
+        run: |
+          novavision service enable server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision service status server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision service disable server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          if-no-files-found: ignore
+          path: |
+            ${{ env.USERPROFILE }}/.novavision/**/*.log
 
   test-macos:
     name: test-macos
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
+    # macos-15-intel is required for Colima (nested virt). GitHub retires this
+    # image in August 2027; after that, move to macos-latest if ARM nested virt
+    # is available, or drop Compose here and keep launchd-only tests.
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -309,6 +403,66 @@ jobs:
       - name: Unit tests
         run: |
           python -m pytest tests -m "not integration" --tb=short -q
+
+      - name: Set up Docker with Colima
+        run: |
+          brew install docker docker-compose colima
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" \
+            "$HOME/.docker/cli-plugins/docker-compose"
+          colima start --cpu 2 --memory 4 --disk 20
+          docker info
+          docker compose version
+
+      - name: Docker Compose integration tests
+        run: python -m pytest tests -m integration -q
+
+      - name: Seed fixture server for CLI
+        run: |
+          mkdir -p "$HOME/.novavision/Server/ci-server/demo"
+          cp tests/fixtures/compose/docker-compose.yml "$HOME/.novavision/Server/ci-server/"
+          cp tests/fixtures/compose/demo/docker-compose.yml "$HOME/.novavision/Server/ci-server/demo/"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / ".novavision" / "servers.json"
+          meta.write_text(
+              json.dumps(
+                  {
+                      "ci-server": {
+                          "name": "ci-server",
+                          "workspace": "ci",
+                          "host": "https://alfa.suite.novavision.ai/",
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: CLI start/stop against real Docker
+        run: |
+          novavision start server
+          novavision start app --id demo
+          novavision stop app --id demo
+          novavision stop server --close-apps
+
+      - name: CLI service enable/status/disable
+        run: |
+          novavision service enable server --id ci-server
+          novavision service status server --id ci-server
+          novavision service disable server --id ci-server
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-logs
+          if-no-files-found: ignore
+          path: |
+            /Users/runner/.novavision/**/*.log
 
   build:
     name: build
