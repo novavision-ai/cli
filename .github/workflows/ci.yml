@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -250,11 +251,11 @@ jobs:
     name: test-windows
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
-    # windows-latest is Server 2025 and defaults to Windows containers.
-    # windows-2022 ships Moby in Linux-container mode, which the alpine
-    # Compose fixtures need.
-    runs-on: windows-2022
-    timeout-minutes: 30
+    # Hosted Windows runners only provide a Windows-container engine.
+    # Alpine Compose fixtures stay on Linux/macOS; this job covers
+    # Windows paths and Task Scheduler.
+    runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -278,81 +279,6 @@ jobs:
       - name: Unit tests
         run: |
           python -m pytest tests -m "not integration" --tb=short -q
-
-      - name: Ensure Docker daemon is running
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          function Get-DockerOsType {
-            try {
-              $value = docker info --format '{{.OSType}}' 2>$null
-              if ($LASTEXITCODE -eq 0 -and $value) {
-                return $value.ToString().Trim().ToLower()
-              }
-            } catch {}
-            return $null
-          }
-
-          function Wait-DockerReady {
-            param([int]$Attempts = 30)
-            for ($i = 0; $i -lt $Attempts; $i++) {
-              docker info *> $null
-              if ($LASTEXITCODE -eq 0) { return $true }
-              Start-Sleep -Seconds 2
-            }
-            return $false
-          }
-
-          try {
-            Start-Service docker
-          } catch {
-            Write-Host "Start-Service docker: $_"
-          }
-          if (-not (Wait-DockerReady)) {
-            docker info
-            throw "Docker daemon did not become ready."
-          }
-
-          $ostype = Get-DockerOsType
-          Write-Host "Docker OSType: $ostype"
-          if ($ostype -ne 'linux') {
-            Write-Host "Switching Docker to Linux containers..."
-            $cli = Join-Path $env:ProgramFiles "Docker\Docker\DockerCli.exe"
-            if (Test-Path $cli) {
-              & $cli -SwitchLinuxEngine
-            } else {
-              $candidates = @(
-                "$env:ProgramFiles\docker\dockerd.exe",
-                "$env:ProgramFiles\Docker\dockerd.exe",
-                "$env:ProgramFiles\Docker\Docker\resources\dockerd.exe"
-              )
-              $dockerd = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-              if (-not $dockerd) {
-                docker info
-                throw "Cannot switch to Linux containers: dockerd.exe not found. OSType=$ostype"
-              }
-              Write-Host "Using dockerd at: $dockerd"
-              Stop-Service docker -Force -ErrorAction SilentlyContinue
-              & $dockerd --unregister-service
-              # windows-2022 Linux-container mode is registered with -G docker.
-              & $dockerd --register-service --service-name docker -G docker
-              Start-Service docker
-            }
-            if (-not (Wait-DockerReady -Attempts 45)) {
-              docker info
-              throw "Docker daemon did not become ready after switching to Linux containers."
-            }
-            $ostype = Get-DockerOsType
-            Write-Host "Docker OSType after switch: $ostype"
-          }
-          if ($ostype -ne 'linux') {
-            docker info
-            throw "Windows CI needs Linux containers to run the same Compose fixtures as Linux. OSType=$ostype"
-          }
-
-      - name: Docker Compose integration tests
-        run: python -m pytest tests -m integration -q
 
       - name: Seed fixture server for CLI
         shell: pwsh
@@ -383,21 +309,12 @@ jobs:
           )
           "@
 
-      - name: CLI start/stop against real Docker
-        shell: pwsh
-        run: |
-          novavision start server
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          novavision start app --id demo
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          novavision stop app --id demo
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          novavision stop server --close-apps
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: CLI service enable/status/disable
         shell: pwsh
         run: |
+          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            throw "docker is required on PATH for service enable."
+          }
           novavision service enable server --id ci-server
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           novavision service status server --id ci-server
