@@ -95,3 +95,119 @@ def test_uninstall_deletes_device_and_local_folder(fake_logger, nv_home):
     )
     assert not server_folder.exists()
     assert "abcdef" not in installer._load_server_metadata()
+
+
+def _write_enabled_server(nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://alfa.suite.novavision.ai", '
+        '"service": {"enabled": true, "name": "novavision-server-abcdef"}}}',
+        encoding="utf-8",
+    )
+    return server_folder
+
+
+def _interactive_installer(fake_logger, answer="y"):
+    fake_logger.answers = [answer]
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = False
+    return installer
+
+
+def test_uninstall_disables_service_when_user_confirms(fake_logger, nv_home):
+    server_folder = _write_enabled_server(nv_home)
+    installer = _interactive_installer(fake_logger)
+    with patch.object(installer.service, "_is_noninteractive", return_value=False):
+        with patch.object(installer.service, "_validate_service_privileges", return_value=True):
+            with patch.object(installer.service, "disable_server", return_value=True) as disable_server:
+                with patch.object(installer, "_delete_device", return_value=True):
+                    with patch.object(installer.docker, "close_server_apps", return_value=True):
+                        with patch.object(installer.docker, "stop_server_folder", return_value=True):
+                            assert installer.uninstall(token="ci-token", server_name="abcdef") is True
+    disable_server.assert_called_once_with(server_name="abcdef")
+    assert fake_logger.messages_of("question")
+    assert not server_folder.exists()
+
+
+def test_uninstall_disables_service_when_id_is_device_id(fake_logger, nv_home):
+    _write_enabled_server(nv_home)
+    installer = _interactive_installer(fake_logger)
+    with patch.object(installer.service, "_is_noninteractive", return_value=False):
+        with patch.object(installer.service, "_validate_service_privileges", return_value=True):
+            with patch.object(installer.service, "disable_server", return_value=True) as disable_server:
+                with patch.object(installer, "_delete_device", return_value=True):
+                    with patch.object(installer.docker, "close_server_apps", return_value=True):
+                        with patch.object(installer.docker, "stop_server_folder", return_value=True):
+                            assert installer.uninstall(token="ci-token", server_name="42") is True
+    disable_server.assert_called_once_with(server_name="abcdef")
+
+
+def test_uninstall_skips_disable_when_service_not_enabled(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://alfa.suite.novavision.ai"}}',
+        encoding="utf-8",
+    )
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = True
+    with patch.object(installer.service, "disable_server", return_value=True) as disable_server:
+        with patch.object(installer, "_delete_device", return_value=True):
+            with patch.object(installer.docker, "close_server_apps", return_value=True):
+                with patch.object(installer.docker, "stop_server_folder", return_value=True):
+                    assert installer.uninstall(token="ci-token", server_name="abcdef") is True
+    disable_server.assert_not_called()
+    assert not fake_logger.messages_of("question")
+
+
+def test_uninstall_stops_when_user_declines_service_disable(fake_logger, nv_home):
+    server_folder = _write_enabled_server(nv_home)
+    installer = _interactive_installer(fake_logger, answer="n")
+    with patch.object(installer.service, "_is_noninteractive", return_value=False):
+        with patch.object(installer.service, "disable_server") as disable_server:
+            with patch.object(installer, "_delete_device") as delete_device:
+                assert installer.uninstall(token="ci-token", server_name="abcdef") is False
+    disable_server.assert_not_called()
+    delete_device.assert_not_called()
+    assert server_folder.exists()
+    assert "abcdef" in installer._load_server_metadata()
+
+
+def test_uninstall_requires_disable_first_when_non_interactive(fake_logger, nv_home):
+    server_folder = _write_enabled_server(nv_home)
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = True
+    with patch.object(installer.service, "disable_server") as disable_server:
+        with patch.object(installer, "_delete_device") as delete_device:
+            assert installer.uninstall(token="ci-token", server_name="abcdef") is False
+    disable_server.assert_not_called()
+    delete_device.assert_not_called()
+    assert server_folder.exists()
+    assert any("Disable it first" in message for message in fake_logger.messages_of("error"))
+
+
+def test_uninstall_stops_when_service_disable_fails(fake_logger, nv_home):
+    server_folder = _write_enabled_server(nv_home)
+    installer = _interactive_installer(fake_logger)
+    with patch.object(installer.service, "_is_noninteractive", return_value=False):
+        with patch.object(installer.service, "_validate_service_privileges", return_value=True):
+            with patch.object(installer.service, "disable_server", return_value=False):
+                with patch.object(installer, "_delete_device") as delete_device:
+                    assert installer.uninstall(token="ci-token", server_name="abcdef") is False
+    delete_device.assert_not_called()
+    assert server_folder.exists()
+    assert "abcdef" in installer._load_server_metadata()
+
+
+def test_uninstall_stops_without_privileges_when_user_confirms_disable(fake_logger, nv_home):
+    server_folder = _write_enabled_server(nv_home)
+    installer = _interactive_installer(fake_logger)
+    with patch.object(installer.service, "_is_noninteractive", return_value=False):
+        with patch.object(installer.service, "_validate_service_privileges", return_value=False):
+            with patch.object(installer.service, "disable_server") as disable_server:
+                with patch.object(installer, "_delete_device") as delete_device:
+                    assert installer.uninstall(token="ci-token", server_name="abcdef") is False
+    disable_server.assert_not_called()
+    delete_device.assert_not_called()
+    assert server_folder.exists()

@@ -63,6 +63,9 @@ class ServiceManager:
         if not server_folder:
             return False
 
+        if not self._validate_service_privileges():
+            return False
+
         service_name = self._service_name(server_folder.name)
         provider = self._provider_name()
         if not self._disable_native_service(service_name):
@@ -420,13 +423,13 @@ shell.Run command, 0, False
         system = platform.system()
         if system == "Linux" and not self._is_root():
             self.log.error(
-                "Linux boot startup requires root. "
+                "Managing the server service requires root. "
                 "Run this command with sudo or as root."
             )
             return False
         if system == "Windows" and not self._is_windows_admin():
             self.log.error(
-                "Windows boot startup requires an Administrator terminal. "
+                "Managing the server service requires an Administrator terminal. "
                 "Reopen the terminal as Administrator and run this command again."
             )
             return False

@@ -10,6 +10,7 @@ from pathlib import Path
 from novavision.logger import ConsoleLogger
 from novavision.utils import get_system_info
 from novavision.docker_manager import DockerManager
+from novavision.service_manager import ServiceManager
 
 
 class Installer:
@@ -20,6 +21,7 @@ class Installer:
     def __init__(self, logger: ConsoleLogger):
         self.log = logger if logger else ConsoleLogger()
         self.docker = DockerManager(logger=self.log)
+        self.service = ServiceManager(logger=self.log, docker_manager=self.docker)
         self.agent_dir = self._create_agent()
         self.non_interactive = False
 
@@ -628,6 +630,9 @@ class Installer:
                     break
 
         server_folder = Path.home() / ".novavision" / "Server" / folder_name
+        if not self._confirm_server_service_disabled(folder_name, server_meta):
+            return False
+
         if server_folder.is_dir():
             self.docker.close_server_apps(server_folder)
             self.docker.stop_server_folder(server_folder)
@@ -662,6 +667,50 @@ class Installer:
                 self.log.warning(f"Could not update server metadata: {e}")
 
         return True
+
+    def _confirm_server_service_disabled(self, folder_name, server_meta):
+        service_meta = (server_meta or {}).get("service") or {}
+        if not service_meta.get("enabled"):
+            return True
+
+        disable_cmd = f"novavision service disable server --id {folder_name}"
+        if not self._can_prompt_for_service_disable():
+            self.log.error(
+                f"Server {folder_name} has a boot service enabled. "
+                f"Disable it first, then uninstall again: {disable_cmd}"
+            )
+            return False
+
+        answer = (
+            self.log.question(
+                f"Server {folder_name} has a boot service enabled. "
+                "Disable it now so uninstall can continue? (y/n)"
+            )
+            .strip()
+            .lower()
+        )
+        if answer != "y":
+            self.log.error(
+                f"Uninstall cancelled. Disable the service first: {disable_cmd}"
+            )
+            return False
+
+        if not self.service._validate_service_privileges():
+            return False
+
+        if self.service.disable_server(server_name=folder_name):
+            return True
+
+        self.log.error(
+            f"Could not disable the OS service for server {folder_name}. "
+            f"Run '{disable_cmd}' from an administrator/root terminal, then uninstall again."
+        )
+        return False
+
+    def _can_prompt_for_service_disable(self):
+        if self.non_interactive:
+            return False
+        return not self.service._is_noninteractive()
 
     def _setup_server(self, register_response, host):
         host = self.format_host(host)

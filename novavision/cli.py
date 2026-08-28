@@ -161,7 +161,6 @@ class NovaVisionCLI:
         uninstall_logger = ConsoleLogger(log_file_path=str(log_file))
         uninstall_logger.info(f"Logging uninstall to {log_file}")
         self.installer = Installer(logger=uninstall_logger)
-        self.installer.non_interactive = True
         success = self.installer.uninstall(token=args.token, server_name=args.id)
         if not success:
             raise SystemExit(1)

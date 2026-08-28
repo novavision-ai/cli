@@ -59,6 +59,16 @@ def test_windows_privilege_check_accepts_admin(fake_logger, nv_home, monkeypatch
     assert service._validate_service_privileges() is True
 
 
+def test_disable_server_requires_privileges(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    service = ServiceManager(logger=fake_logger)
+    with patch.object(service, "_validate_service_privileges", return_value=False):
+        with patch.object(service, "_disable_native_service") as disable_native:
+            assert service.disable_server(server_name="abcdef") is False
+    disable_native.assert_not_called()
+
+
 @pytest.mark.skipif(platform.system() == "Windows", reason="geteuid is a Unix API")
 def test_is_root_matches_geteuid(fake_logger, nv_home, monkeypatch):
     service = ServiceManager(logger=fake_logger)
