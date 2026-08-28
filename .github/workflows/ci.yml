@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -147,8 +145,7 @@ jobs:
       needs.test-linux.result == 'success' &&
       (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'pull_request' && github.base_ref == 'main')
+        github.event_name == 'pull_request'
       )
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -478,7 +475,7 @@ jobs:
           WINDOWS: ${{ needs.test-windows.result }}
           MACOS: ${{ needs.test-macos.result }}
           BUILD: ${{ needs.build.result }}
-          LIVE_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
+          LIVE_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' }}
         run: |
           set -euo pipefail
           echo "changes=$CHANGES run_ci=$RUN_CI linux=$LINUX live=$LIVE live_required=$LIVE_REQUIRED windows=$WINDOWS macos=$MACOS build=$BUILD"
