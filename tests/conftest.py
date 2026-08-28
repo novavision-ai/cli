@@ -1,5 +1,32 @@
+import os
+import subprocess
+
 import pytest
 from pathlib import Path
+
+
+def _current_docker_host():
+    existing = os.environ.get("DOCKER_HOST")
+    if existing:
+        return existing
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "context",
+                "inspect",
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    host = (result.stdout or "").strip()
+    if result.returncode == 0 and host:
+        return host
+    return None
 
 
 class DummyLoading:
@@ -53,7 +80,10 @@ def fake_logger():
 def nv_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
+    docker_host = _current_docker_host()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setattr(Path, "home", lambda *args, **kwargs: home)
+    if docker_host:
+        monkeypatch.setenv("DOCKER_HOST", docker_host)
     return home

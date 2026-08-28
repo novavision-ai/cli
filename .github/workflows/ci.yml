@@ -250,7 +250,10 @@ jobs:
     name: test-windows
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
-    runs-on: windows-latest
+    # windows-latest is Server 2025 and defaults to Windows containers.
+    # windows-2022 ships Moby in Linux-container mode, which the alpine
+    # Compose fixtures need.
+    runs-on: windows-2022
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -280,26 +283,69 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+
+          function Get-DockerOsType {
+            try {
+              $value = docker info --format '{{.OSType}}' 2>$null
+              if ($LASTEXITCODE -eq 0 -and $value) {
+                return $value.ToString().Trim().ToLower()
+              }
+            } catch {}
+            return $null
+          }
+
+          function Wait-DockerReady {
+            param([int]$Attempts = 30)
+            for ($i = 0; $i -lt $Attempts; $i++) {
+              docker info *> $null
+              if ($LASTEXITCODE -eq 0) { return $true }
+              Start-Sleep -Seconds 2
+            }
+            return $false
+          }
+
           try {
             Start-Service docker
           } catch {
             Write-Host "Start-Service docker: $_"
           }
-          $ok = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            docker info *> $null
-            if ($LASTEXITCODE -eq 0) {
-              $ok = $true
-              break
-            }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $ok) {
+          if (-not (Wait-DockerReady)) {
             docker info
             throw "Docker daemon did not become ready."
           }
-          $ostype = (docker info --format '{{.OSType}}').Trim()
+
+          $ostype = Get-DockerOsType
           Write-Host "Docker OSType: $ostype"
+          if ($ostype -ne 'linux') {
+            Write-Host "Switching Docker to Linux containers..."
+            $cli = Join-Path $env:ProgramFiles "Docker\Docker\DockerCli.exe"
+            if (Test-Path $cli) {
+              & $cli -SwitchLinuxEngine
+            } else {
+              $candidates = @(
+                "$env:ProgramFiles\docker\dockerd.exe",
+                "$env:ProgramFiles\Docker\dockerd.exe",
+                "$env:ProgramFiles\Docker\Docker\resources\dockerd.exe"
+              )
+              $dockerd = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if (-not $dockerd) {
+                docker info
+                throw "Cannot switch to Linux containers: dockerd.exe not found. OSType=$ostype"
+              }
+              Write-Host "Using dockerd at: $dockerd"
+              Stop-Service docker -Force -ErrorAction SilentlyContinue
+              & $dockerd --unregister-service
+              # windows-2022 Linux-container mode is registered with -G docker.
+              & $dockerd --register-service --service-name docker -G docker
+              Start-Service docker
+            }
+            if (-not (Wait-DockerReady -Attempts 45)) {
+              docker info
+              throw "Docker daemon did not become ready after switching to Linux containers."
+            }
+            $ostype = Get-DockerOsType
+            Write-Host "Docker OSType after switch: $ostype"
+          }
           if ($ostype -ne 'linux') {
             docker info
             throw "Windows CI needs Linux containers to run the same Compose fixtures as Linux. OSType=$ostype"
@@ -411,6 +457,10 @@ jobs:
           ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" \
             "$HOME/.docker/cli-plugins/docker-compose"
           colima start --cpu 2 --memory 4 --disk 20
+          docker context use colima
+          docker_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          echo "DOCKER_HOST=${docker_host}" >> "$GITHUB_ENV"
+          export DOCKER_HOST="${docker_host}"
           docker info
           docker compose version
 
