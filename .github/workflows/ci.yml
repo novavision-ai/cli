@@ -1,0 +1,495 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.decide.outputs.run_ci }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect test-relevant changes
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            run_ci:
+              - "novavision/**"
+              - "tests/**"
+              - "setup.py"
+              - "pyproject.toml"
+              - ".github/workflows/**"
+
+      - name: Decide whether to run tests
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_ci=${{ steps.filter.outputs.run_ci }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-linux:
+    name: test-linux
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" \
+            --cov=novavision \
+            --cov-report=term \
+            --cov-report=xml \
+            --junitxml=unit-test-results.xml
+
+      - name: Docker Compose integration tests
+        run: python -m pytest tests -m integration -q
+
+      - name: Seed fixture server for CLI
+        run: |
+          mkdir -p "$HOME/.novavision/Server/ci-server/demo"
+          cp tests/fixtures/compose/docker-compose.yml "$HOME/.novavision/Server/ci-server/"
+          cp tests/fixtures/compose/demo/docker-compose.yml "$HOME/.novavision/Server/ci-server/demo/"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / ".novavision" / "servers.json"
+          meta.write_text(
+              json.dumps(
+                  {
+                      "ci-server": {
+                          "name": "ci-server",
+                          "workspace": "ci",
+                          "host": "https://alfa.suite.novavision.ai/",
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: CLI start/stop against real Docker
+        run: |
+          novavision start server
+          novavision start app --id demo
+          novavision stop app --id demo
+          novavision stop server --close-apps
+
+      - name: CLI service enable/status/disable
+        run: |
+          sudo systemctl enable docker
+          novavision_bin="$(command -v novavision)"
+          sudo "$novavision_bin" service enable server --id ci-server
+          sudo "$novavision_bin" service status server --id ci-server
+          sudo "$novavision_bin" service disable server --id ci-server
+
+      - name: Upload coverage and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-logs
+          if-no-files-found: ignore
+          path: |
+            coverage.xml
+            unit-test-results.xml
+            ${{ github.workspace }}/.coverage
+            /home/runner/.novavision/**/*.log
+
+  test-linux-live:
+    name: test-linux-live
+    needs: [changes, test-linux]
+    if: >
+      needs.changes.outputs.run_ci == 'true' &&
+      needs.test-linux.result == 'success' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.base_ref == 'main')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: live-install
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Live install against NovaVision API
+        id: live_install
+        env:
+          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
+          NOVAVISION_WORKSPACE: ${{ secrets.NOVAVISION_WORKSPACE || vars.NOVAVISION_WORKSPACE }}
+          NOVAVISION_HOST: ${{ secrets.NOVAVISION_HOST || vars.NOVAVISION_HOST || 'alfa.suite.novavision.ai' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NOVAVISION_USER_TOKEN:-}" ] || [ -z "${NOVAVISION_WORKSPACE:-}" ]; then
+            echo "::error::NOVAVISION_USER_TOKEN or NOVAVISION_WORKSPACE is missing. Add them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          set +e
+          novavision install local "$NOVAVISION_USER_TOKEN" \
+            --host "$NOVAVISION_HOST" \
+            --workspace "$NOVAVISION_WORKSPACE" \
+            --port 7001 \
+            --non-interactive
+          install_status=$?
+          set -e
+          live_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta_path = Path.home() / ".novavision" / "servers.json"
+          if not meta_path.exists():
+              print("")
+              raise SystemExit(0)
+          metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+          live = [
+              name
+              for name, data in metadata.items()
+              if data.get("id_device")
+          ]
+          print(live[-1] if live else "")
+          PY
+          )"
+          echo "server_id=$live_id" >> "$GITHUB_OUTPUT"
+          export LIVE_SERVER="$live_id"
+          if [ "$install_status" -ne 0 ]; then
+            exit "$install_status"
+          fi
+          if [ -z "$live_id" ]; then
+            echo "::error::novavision install did not record a server id."
+            exit 1
+          fi
+          if [ ! -f "$HOME/.novavision/Server/$live_id/docker-compose.yml" ]; then
+            echo "::error::novavision install did not create a server compose file."
+            exit 1
+          fi
+          novavision start server --id "$live_id"
+          app_id="$(python - <<'PY'
+          import os
+          from pathlib import Path
+
+          server = Path.home() / ".novavision" / "Server" / os.environ["LIVE_SERVER"]
+          apps = [path.parent.name for path in server.glob("*/docker-compose.yml")]
+          print(apps[0] if apps else "")
+          PY
+          )"
+          if [ -z "$app_id" ]; then
+            echo "::error::install succeeded but no app compose file was found."
+            exit 1
+          fi
+          novavision start app --id "$app_id"
+          novavision stop app --id "$app_id"
+          novavision stop server --id "$live_id" --close-apps
+
+      - name: Remove CI device
+        if: ${{ always() && steps.live_install.outputs.server_id != '' }}
+        env:
+          NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
+        run: |
+          set -euo pipefail
+          novavision uninstall server "$NOVAVISION_USER_TOKEN" \
+            --id "${{ steps.live_install.outputs.server_id }}"
+
+  test-windows:
+    name: test-windows
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
+    # Hosted Windows runners only provide a Windows-container engine.
+    # Alpine Compose fixtures stay on Linux/macOS; this job covers
+    # Windows paths and Task Scheduler.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" --tb=short -q
+
+      - name: Seed fixture server for CLI
+        shell: pwsh
+        run: |
+          $server = Join-Path $env:USERPROFILE ".novavision\Server\ci-server"
+          $demo = Join-Path $server "demo"
+          New-Item -ItemType Directory -Force -Path $demo | Out-Null
+          Copy-Item "tests\fixtures\compose\docker-compose.yml" $server
+          Copy-Item "tests\fixtures\compose\demo\docker-compose.yml" $demo
+          python -c @"
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / '.novavision' / 'servers.json'
+          meta.parent.mkdir(parents=True, exist_ok=True)
+          meta.write_text(
+              json.dumps(
+                  {
+                      'ci-server': {
+                          'name': 'ci-server',
+                          'workspace': 'ci',
+                          'host': 'https://alfa.suite.novavision.ai/',
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding='utf-8',
+          )
+          "@
+
+      - name: CLI service enable/status/disable
+        shell: pwsh
+        run: |
+          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            throw "docker is required on PATH for service enable."
+          }
+          novavision service enable server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision service status server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          novavision service disable server --id ci-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          if-no-files-found: ignore
+          path: |
+            ${{ env.USERPROFILE }}/.novavision/**/*.log
+
+  test-macos:
+    name: test-macos
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
+    # macos-15-intel is required for Colima (nested virt). GitHub retires this
+    # image in August 2027; after that, move to macos-latest if ARM nested virt
+    # is available, or drop Compose here and keep launchd-only tests.
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CLI and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          novavision --help
+
+      - name: Lint
+        run: |
+          python -m compileall -q novavision
+          ruff check novavision tests
+
+      - name: Unit tests
+        run: |
+          python -m pytest tests -m "not integration" --tb=short -q
+
+      - name: Set up Docker with Colima
+        run: |
+          brew install docker docker-compose colima
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" \
+            "$HOME/.docker/cli-plugins/docker-compose"
+          colima start --cpu 2 --memory 4 --disk 20
+          docker context use colima
+          docker_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+          echo "DOCKER_HOST=${docker_host}" >> "$GITHUB_ENV"
+          export DOCKER_HOST="${docker_host}"
+          docker info
+          docker compose version
+
+      - name: Docker Compose integration tests
+        run: python -m pytest tests -m integration -q
+
+      - name: Seed fixture server for CLI
+        run: |
+          mkdir -p "$HOME/.novavision/Server/ci-server/demo"
+          cp tests/fixtures/compose/docker-compose.yml "$HOME/.novavision/Server/ci-server/"
+          cp tests/fixtures/compose/demo/docker-compose.yml "$HOME/.novavision/Server/ci-server/demo/"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          meta = Path.home() / ".novavision" / "servers.json"
+          meta.write_text(
+              json.dumps(
+                  {
+                      "ci-server": {
+                          "name": "ci-server",
+                          "workspace": "ci",
+                          "host": "https://alfa.suite.novavision.ai/",
+                      }
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: CLI start/stop against real Docker
+        run: |
+          novavision start server
+          novavision start app --id demo
+          novavision stop app --id demo
+          novavision stop server --close-apps
+
+      - name: CLI service enable/status/disable
+        run: |
+          novavision service enable server --id ci-server
+          novavision service status server --id ci-server
+          novavision service disable server --id ci-server
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-logs
+          if-no-files-found: ignore
+          path: |
+            /Users/runner/.novavision/**/*.log
+
+  build:
+    name: build
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  ci:
+    name: ci
+    needs: [changes, test-linux, test-linux-live, test-windows, test-macos, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN_CI: ${{ needs.changes.outputs.run_ci }}
+          LINUX: ${{ needs.test-linux.result }}
+          LIVE: ${{ needs.test-linux-live.result }}
+          WINDOWS: ${{ needs.test-windows.result }}
+          MACOS: ${{ needs.test-macos.result }}
+          BUILD: ${{ needs.build.result }}
+          LIVE_REQUIRED: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
+        run: |
+          set -euo pipefail
+          echo "changes=$CHANGES run_ci=$RUN_CI linux=$LINUX live=$LIVE live_required=$LIVE_REQUIRED windows=$WINDOWS macos=$MACOS build=$BUILD"
+          if [ "$CHANGES" != "success" ]; then
+            exit 1
+          fi
+          if [ "$RUN_CI" != "true" ]; then
+            echo "No test-relevant files changed; OS jobs were skipped."
+            exit 0
+          fi
+          for result in "$LINUX" "$WINDOWS" "$MACOS" "$BUILD"; do
+            if [ "$result" != "success" ]; then
+              exit 1
+            fi
+          done
+          if [ "$LIVE_REQUIRED" = "true" ]; then
+            if [ "$LIVE" != "success" ]; then
+              exit 1
+            fi
+          fi
