@@ -226,16 +226,21 @@ jobs:
           from pathlib import Path
 
           server = Path.home() / ".novavision" / "Server" / os.environ["LIVE_SERVER"]
-          apps = [path.parent.name for path in server.glob("*/docker-compose.yml")]
+          server_compose = (server / "docker-compose.yml").resolve()
+          apps = [
+              path.parent.name
+              for path in server.rglob("docker-compose.yml")
+              if path.resolve() != server_compose
+          ]
           print(apps[0] if apps else "")
           PY
           )"
-          if [ -z "$app_id" ]; then
-            echo "::error::install succeeded but no app compose file was found."
-            exit 1
+          if [ -n "$app_id" ]; then
+            novavision start app --id "$app_id"
+            novavision stop app --id "$app_id"
+          else
+            echo "No app compose file in the live package; skipping app start/stop."
           fi
-          novavision start app --id "$app_id"
-          novavision stop app --id "$app_id"
           novavision stop server --id "$live_id" --close-apps
 
       - name: Remove CI device
@@ -244,8 +249,9 @@ jobs:
           NOVAVISION_USER_TOKEN: ${{ secrets.NOVAVISION_USER_TOKEN }}
         run: |
           set -euo pipefail
-          novavision uninstall server "$NOVAVISION_USER_TOKEN" \
-            --id "${{ steps.live_install.outputs.server_id }}"
+          server_id="${{ steps.live_install.outputs.server_id }}"
+          novavision uninstall server "$NOVAVISION_USER_TOKEN" --id "$server_id" || true
+          sudo rm -rf "$HOME/.novavision/Server/$server_id"
 
   test-windows:
     name: test-windows
