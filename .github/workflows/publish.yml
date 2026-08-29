@@ -20,11 +20,6 @@ on:
         description: "CI run ID whose dist artifact to publish (from the run URL). Leave empty to rebuild this branch."
         required: false
         type: string
-      github_release:
-        description: "Also create a GitHub Release with the same files"
-        required: true
-        type: boolean
-        default: true
 
 concurrency:
   group: publish
@@ -55,7 +50,6 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - name: Resolve commit
         id: resolve
@@ -161,7 +155,6 @@ jobs:
           output = os.environ["GITHUB_OUTPUT"]
           with open(output, "a", encoding="utf-8") as fh:
               fh.write(f"version={version}\n")
-              fh.write(f"sha={os.environ['SHA']}\n")
           print(f"Publishing novavision-cli {version} from {os.environ['SHA']}")
           PY
 
@@ -196,36 +189,3 @@ jobs:
       - name: Summary
         run: |
           echo "Published **novavision-cli ${{ needs.package.outputs.version }}** to [PyPI](https://pypi.org/project/novavision-cli/${{ needs.package.outputs.version }}/)." >> "$GITHUB_STEP_SUMMARY"
-
-  github-release:
-    name: github-release
-    needs: [package, pypi]
-    if: ${{ inputs.github_release }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.package.outputs.version }}
-          SHA: ${{ needs.package.outputs.sha }}
-        run: |
-          set -euo pipefail
-          tag="v${VERSION}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::GitHub release ${tag} already exists."
-            exit 1
-          fi
-          gh release create "$tag" dist/* \
-            --title "$tag" \
-            --target "$SHA" \
-            --generate-notes
-          echo "GitHub release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"
