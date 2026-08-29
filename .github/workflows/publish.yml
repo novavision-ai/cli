@@ -1,0 +1,231 @@
+# Manual PyPI publish. Nothing here runs on push, merge, or tag.
+#
+# Use: Actions → Publish → select main → Run workflow.
+# Optional: paste a CI run ID to upload that run's dist artifact instead of rebuilding.
+#
+# One-time setup:
+# 1. GitHub → Settings → Environments → create "pypi".
+#    Add required reviewers if a second person must approve each upload.
+# 2. PyPI → novavision-cli → Publishing → Trusted Publisher:
+#      owner / repo  = this GitHub repository
+#      workflow      = publish.yml
+#      environment   = pypi
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "CI run ID whose dist artifact to publish (from the run URL). Leave empty to rebuild this branch."
+        required: false
+        type: string
+      github_release:
+        description: "Also create a GitHub Release with the same files"
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Publish from main (select main in the Run workflow dropdown)."
+            exit 1
+          fi
+
+  package:
+    name: package
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Resolve commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAW_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          raw="${RAW_RUN_ID:-}"
+          raw="${raw%%[[:space:]]*}"
+          raw="${raw%/}"
+          run_id="${raw##*/}"
+
+          if [ -n "$run_id" ]; then
+            conclusion="$(gh run view "$run_id" --json conclusion --jq .conclusion)"
+            if [ "$conclusion" != "success" ]; then
+              echo "::error::CI run ${run_id} did not succeed (conclusion=${conclusion})."
+              exit 1
+            fi
+            sha="$(gh run view "$run_id" --json headSha --jq .headSha)"
+            echo "Using dist from run ${run_id} at ${sha}"
+          else
+            sha="${{ github.sha }}"
+            echo "Rebuilding from ${sha}"
+          fi
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - name: Set up Python
+        if: steps.resolve.outputs.run_id == ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download CI dist
+        if: steps.resolve.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
+
+      - name: Build sdist and wheel
+        if: steps.resolve.outputs.run_id == ''
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Read version and refuse a PyPI duplicate
+        id: meta
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import urllib.error
+          import urllib.request
+
+          dist = pathlib.Path("dist")
+          wheels = sorted(dist.glob("*.whl"))
+          sdists = sorted(dist.glob("*.tar.gz"))
+          if len(wheels) != 1 or not sdists:
+              print(f"::error::Expected one wheel and at least one sdist in dist/, got {wheels} {sdists}", file=sys.stderr)
+              sys.exit(1)
+
+          version = wheels[0].stem.split("-")[1]
+          init_version = None
+          init_path = pathlib.Path("novavision/__init__.py")
+          for line in init_path.read_text(encoding="utf-8").splitlines():
+              if line.startswith("__version__"):
+                  init_version = line.split("=", 1)[1].strip().strip("\"'")
+                  break
+          if init_version and init_version != version:
+              print(
+                  f"::error::Wheel version {version} does not match novavision/__init__.py ({init_version})",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          url = f"https://pypi.org/pypi/novavision-cli/{version}/json"
+          request = urllib.request.Request(url, headers={"User-Agent": "novavision-cli-publish"})
+          try:
+              urllib.request.urlopen(request, timeout=30)
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+          else:
+              print(
+                  f"::error::novavision-cli {version} is already on PyPI. Bump __version__ first.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          output = os.environ["GITHUB_OUTPUT"]
+          with open(output, "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"sha={os.environ['SHA']}\n")
+          print(f"Publishing novavision-cli {version} from {os.environ['SHA']}")
+          PY
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  pypi:
+    name: pypi
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/novavision-cli
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Summary
+        run: |
+          echo "Published **novavision-cli ${{ needs.package.outputs.version }}** to [PyPI](https://pypi.org/project/novavision-cli/${{ needs.package.outputs.version }}/)." >> "$GITHUB_STEP_SUMMARY"
+
+  github-release:
+    name: github-release
+    needs: [package, pypi]
+    if: ${{ inputs.github_release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.package.outputs.version }}
+          SHA: ${{ needs.package.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::GitHub release ${tag} already exists."
+            exit 1
+          fi
+          gh release create "$tag" dist/* \
+            --title "$tag" \
+            --target "$SHA" \
+            --generate-notes
+          echo "GitHub release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"
