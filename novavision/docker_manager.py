@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import yaml
 import shutil
 import subprocess
@@ -9,10 +10,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from rich.markup import escape
 from novavision.logger import ConsoleLogger
+
+# CSI / OSC sequences from BuildKit and pip progress bars.
+_ANSI_ESCAPE = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])"
+)
 
 
 class DockerManager:
+    STATUS_MARK = "●"
+    ASCII_STATUS_MARK = "*"
+
     MONTHS = [
         "Jan",
         "Feb",
@@ -93,48 +103,221 @@ class DockerManager:
         host_label = self._host_label(host)
         service = server_metadata.get("service", {})
         service_status = "enabled" if service.get("enabled") else "disabled"
+        running_mark = self._running_status_mark(self._server_is_running(folder))
 
         return (
-            f"{folder.name} | Created: {created_at} | Workspace: {workspace} "
-            f"| Host: {host_label} | Service: {service_status}"
+            f"{running_mark} {escape(folder.name)} | Created: {escape(str(created_at))} "
+            f"| Workspace: {escape(str(workspace))} "
+            f"| Host: {escape(str(host_label))} | Service: {escape(service_status)}"
         )
 
+    def _visible_server_folders(self, server_path):
+        if not server_path or not Path(server_path).is_dir():
+            return []
+        return sorted(
+            [
+                item
+                for item in Path(server_path).iterdir()
+                if item.is_dir() and not item.name.startswith(".")
+            ],
+            key=lambda folder: folder.name,
+        )
+
+    def _server_record(self, folder, metadata):
+        server_metadata = metadata.get(folder.name, {})
+        created_at = self._format_created_at(
+            server_metadata.get("created_at", "Unknown")
+        )
+        workspace = server_metadata.get("workspace", "Unknown")
+        host_label = self._host_label(server_metadata.get("host"))
+        service = server_metadata.get("service", {})
+        service_status = "enabled" if service.get("enabled") else "disabled"
+        running = self._server_is_running(folder)
+        return {
+            "id": folder.name,
+            "folder": folder,
+            "running": running,
+            "mark": self._running_status_mark(running),
+            "created": created_at,
+            "workspace": workspace,
+            "host": host_label,
+            "service": service_status,
+            "apps": list(self._server_app_compose_files(folder)),
+            "name": server_metadata.get("name") or folder.name,
+        }
+
+    def _plain_server_record(self, record):
+        return {
+            "id": record["id"],
+            "name": record["name"],
+            "running": record["running"],
+            "created": record["created"],
+            "workspace": record["workspace"],
+            "host": record["host"],
+            "service": record["service"],
+            "apps": record["apps"],
+        }
+
+    def _print_server_table(self, records, show_apps=True, numbered=False):
+        headers = ["", "ID", "Created", "Workspace", "Host", "Service"]
+        if numbered:
+            headers = ["#"] + headers
+        if show_apps:
+            headers.append("Apps")
+        rows = []
+        for index, record in enumerate(records, start=1):
+            row = [
+                record["mark"],
+                record["id"],
+                record["created"],
+                record["workspace"],
+                record["host"],
+                record["service"],
+            ]
+            if numbered:
+                row = [str(index)] + row
+            if show_apps:
+                row.append(", ".join(record["apps"]) if record["apps"] else "-")
+            rows.append(row)
+        self.log.table(headers, rows)
+
+    def list_servers(self):
+        folders = self._visible_server_folders(Path.home() / ".novavision" / "Server")
+        if not folders:
+            self.log.error("No server folders found!")
+            return False
+        metadata = self._load_server_metadata()
+        records = [self._server_record(folder, metadata) for folder in folders]
+        if getattr(self.log, "json_mode", False):
+            self.log.emit_json([self._plain_server_record(record) for record in records])
+            return True
+        self._print_server_table(records)
+        return True
+
+    def show_status(self, server_name=None):
+        if server_name:
+            folder = self.get_server_folder(server_name)
+            if not folder:
+                return False
+            folders = [folder]
+        else:
+            folders = self._visible_server_folders(Path.home() / ".novavision" / "Server")
+            if not folders:
+                self.log.error("No server folders found!")
+                return False
+
+        metadata = self._load_server_metadata()
+        payload = []
+        json_mode = getattr(self.log, "json_mode", False)
+        for folder in folders:
+            record = self._server_record(folder, metadata)
+            apps = [
+                {
+                    "id": app_name,
+                    "running": self._compose_is_running(compose_file),
+                }
+                for app_name, compose_file in self._server_app_compose_files(folder).items()
+            ]
+            plain = self._plain_server_record(record)
+            plain["apps"] = apps
+            payload.append(plain)
+            if json_mode:
+                continue
+            self._print_server_table([record], show_apps=False)
+            if apps:
+                self.log.table(
+                    ["", "App"],
+                    [
+                        [self._running_status_mark(app["running"]), app["id"]]
+                        for app in apps
+                    ],
+                    title=f"Apps on {record['id']}",
+                )
+            else:
+                self.log.info(f"No apps found for server {record['id']}.")
+        if json_mode:
+            self.log.emit_json(payload[0] if server_name and payload else payload)
+        return True
+
+    def show_logs(self, resource_type, resource_id, follow=False, tail=None):
+        if resource_type == "server":
+            folder = self.get_server_folder(resource_id)
+            if not folder:
+                return False
+            compose_file = folder / "docker-compose.yml"
+        elif resource_type == "app":
+            _, compose_file = self._find_app(resource_id)
+            if not compose_file:
+                return False
+        else:
+            self.log.error("Logs are only available for server or app.")
+            return False
+
+        if not compose_file.exists():
+            self.log.error(f"No docker-compose.yml found in {compose_file.parent}!")
+            return False
+
+        args = ["logs"]
+        if follow:
+            args.append("--follow")
+        if tail is not None:
+            args.extend(["--tail", str(tail)])
+        try:
+            self.run_docker_compose(compose_file, *args, capture=False)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            self.log.error(f"Error reading logs: {e}")
+            return False
+
+    def _stdout_can_encode_status_marks(self, encoding=None, is_tty=None):
+        if encoding is None:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            f"{self.STATUS_MARK}".encode(encoding)
+            return True
+        except (LookupError, UnicodeEncodeError):
+            pass
+
+        # Windows interactive consoles use Unicode APIs even when encoding is cp1252.
+        if sys.platform == "win32":
+            if is_tty is None:
+                try:
+                    is_tty = bool(sys.stdout.isatty())
+                except Exception:
+                    is_tty = False
+            return bool(is_tty)
+        return False
+
+    def _running_status_mark(self, running):
+        glyph = (
+            self.STATUS_MARK
+            if self._stdout_can_encode_status_marks()
+            else self.ASCII_STATUS_MARK
+        )
+        color = "green" if running else "red"
+        return f"[{color}]{glyph}[/{color}]"
+
     def choose_server_folder(self, server_path):
-        server_folders = [item for item in server_path.iterdir() if item.is_dir()]
-        visible_folders = [f for f in server_folders if not f.name.startswith(".")]
+        visible_folders = self._visible_server_folders(server_path)
         metadata = self._load_server_metadata()
 
-        if not server_folders:
+        if not visible_folders:
             self.log.error("No server folders found!")
             return None
 
+        records = [self._server_record(folder, metadata) for folder in visible_folders]
+        self._print_server_table(records, numbered=len(visible_folders) > 1)
         if len(visible_folders) == 1:
-            self.log.info(
-                f"Selected server: {self._format_server_details(visible_folders[0], metadata)}"
-            )
             return visible_folders[0]
-        elif len(visible_folders) > 1:
-            self.log.info("Multiple server folders found. Please select one")
-            for idx, folder in enumerate(visible_folders):
-                self.log.info(
-                    f"{idx + 1}. {self._format_server_details(folder, metadata)}"
-                )
-            while True:
-                try:
-                    choice = int(
-                        self.log.question(
-                            "Enter the number of the server you want to select"
-                        )
-                    )
-                    if 1 <= choice <= len(visible_folders):
-                        return visible_folders[choice - 1]
-                    else:
-                        self.log.warning(
-                            "Invalid selection. Please enter a valid number."
-                        )
-                except ValueError:
-                    self.log.warning("Invalid input. Please enter a number.")
-        return server_folders[0]
+
+        index = self.log.ask_index(
+            "Enter the number of the server you want to select",
+            len(visible_folders),
+        )
+        if index is None or not (0 <= index < len(visible_folders)):
+            self.log.error("Invalid server selection.")
+            return None
+        return visible_folders[index]
 
     def get_server_folder(self, server_name=None):
         server_path = Path.home() / ".novavision" / "Server"
@@ -281,38 +464,125 @@ class DockerManager:
             return ["docker-compose"]
         return None
 
-    def run_docker_compose(self, compose_file, *args):
+    def run_docker_compose(self, compose_file, *args, capture=None):
         compose_command = self._docker_compose_command()
         if not compose_command:
             raise FileNotFoundError("Docker Compose is not available.")
 
-        subprocess.run(
-            compose_command + ["-f", str(compose_file)] + list(args),
-            check=True,
+        should_capture = capture
+        if should_capture is None:
+            should_capture = bool(getattr(self.log, "log_file_path", None)) and (
+                not args or args[0] != "logs"
+            )
+
+        command = list(compose_command)
+        if (
+            should_capture
+            and args
+            and args[0] == "build"
+            and compose_command[:2] == ["docker", "compose"]
+        ):
+            command.extend(["--progress", "plain"])
+        command.extend(["-f", str(compose_file)])
+        command.extend(args)
+
+        if not should_capture:
+            subprocess.run(command, check=True)
+            return
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
         )
+        chunks = []
+        try:
+            self._stream_compose_output(process, chunks)
+        finally:
+            process.wait()
+
+        combined = b"".join(chunks).decode("utf-8", errors="replace")
+        if process.returncode:
+            error = subprocess.CalledProcessError(
+                process.returncode, command, output=combined
+            )
+            error.stderr = combined
+            raise error
+
+    def _stream_compose_output(self, process, chunks):
+        stdout = process.stdout
+        pending = b""
+        while True:
+            chunk = stdout.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            self.log.write_raw(chunk.decode("utf-8", errors="replace").replace("\r", "\n"))
+            pending += chunk
+            pending = self._echo_compose_lines(pending)
+        if pending:
+            self._echo_compose_lines(pending + b"\n")
+
+    def _echo_compose_lines(self, pending):
+        while True:
+            newline_at = pending.find(b"\n")
+            if newline_at < 0:
+                return pending
+            line = pending[: newline_at + 1]
+            pending = pending[newline_at + 1 :]
+            visible = self._visible_compose_line(line)
+            if visible:
+                self._write_compose_console(visible)
+
+    def _visible_compose_line(self, line):
+        text = line.decode("utf-8", errors="replace")
+        text = text.split("\r")[-1]
+        text = _ANSI_ESCAPE.sub("", text)
+        text = text.replace("\x08", "").replace("\x00", "").strip()
+        return text
+
+    def _write_compose_console(self, text):
+        if getattr(self.log, "quiet", False) or getattr(self.log, "json_mode", False):
+            return
+        console = getattr(self.log, "console", None)
+        if console is not None:
+            console.print(
+                text,
+                markup=False,
+                highlight=False,
+                overflow="ignore",
+                crop=True,
+                soft_wrap=False,
+            )
+            return
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
 
     def wait_for_docker(self, timeout_seconds=300, interval_seconds=5):
         if not shutil.which("docker"):
             self.log.error("Docker is not installed. Please install Docker first.")
             return False
 
-        self.log.info("Checking Docker availability")
         deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            result = subprocess.run(
-                ["docker", "info"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                self.log.success("Docker is available.")
-                return True
-            time.sleep(interval_seconds)
+        with self.log.loading("Waiting for Docker"):
+            while time.time() < deadline:
+                result = subprocess.run(
+                    ["docker", "info"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode == 0:
+                    break
+                time.sleep(interval_seconds)
+            else:
+                self.log.error(
+                    f"Docker did not become available within {timeout_seconds} seconds."
+                )
+                return False
 
-        self.log.error(
-            f"Docker did not become available within {timeout_seconds} seconds."
-        )
-        return False
+        self.log.success("Docker is available.")
+        return True
 
     def _start_server(self, docker_compose_file, label="server"):
         previous_containers = set(
@@ -371,13 +641,9 @@ class DockerManager:
             )
         return matches[0]
 
-    def _server_is_running(self, server_folder):
-        if not server_folder:
-            return False
-
-        compose_file = server_folder / "docker-compose.yml"
+    def _compose_is_running(self, compose_file):
         compose_command = self._docker_compose_command()
-        if not compose_command or not compose_file.exists():
+        if not compose_command or not compose_file or not Path(compose_file).exists():
             return False
 
         result = subprocess.run(
@@ -388,6 +654,11 @@ class DockerManager:
         if result.returncode != 0:
             return False
         return any(line.strip() for line in result.stdout.splitlines())
+
+    def _server_is_running(self, server_folder):
+        if not server_folder:
+            return False
+        return self._compose_is_running(Path(server_folder) / "docker-compose.yml")
 
     def _require_running_server_for_app(self, app_name):
         server_folder, compose_file = self._find_app(app_name)
@@ -502,17 +773,29 @@ class DockerManager:
             self.log.error(f"Error stopping server apps: {e}")
             return False
 
+    def _warn_remaining_apps(self, server_folder, close_apps):
+        if close_apps or not server_folder:
+            return
+        apps = self._server_app_compose_files(server_folder)
+        if apps:
+            self.log.warning(
+                f"{len(apps)} app(s) belong to this server and will keep running. "
+                "Pass --close-apps to stop them."
+            )
+
     def _stop_server(
         self, server_path, select_server=True, close_apps=False, server_name=None
     ):
         if server_name:
             server_folder = self.get_server_folder(server_name)
+            self._warn_remaining_apps(server_folder, close_apps)
             if close_apps:
                 self.close_server_apps(server_folder)
             return self.stop_server_folder(server_folder)
 
         if select_server:
             server_folder = self.choose_server_folder(server_path)
+            self._warn_remaining_apps(server_folder, close_apps)
             if close_apps:
                 self.close_server_apps(server_folder)
             return self.stop_server_folder(server_folder)
@@ -525,6 +808,7 @@ class DockerManager:
         for folder in server_folders:
             docker_compose_file = folder / "docker-compose.yml"
             if docker_compose_file.exists():
+                self._warn_remaining_apps(folder, close_apps)
                 if close_apps:
                     self.close_server_apps(folder)
                 try:
@@ -569,9 +853,11 @@ class DockerManager:
                 new_containers.append((container_name, port_display))
 
         if new_containers:
-            self.log.info("Started containers:")
-            for name, ports in new_containers:
-                self.log.info(f"- {name} -> Ports: {ports}")
+            self.log.table(
+                ["Container", "Host ports"],
+                [(name, ports) for name, ports in new_containers],
+                title="Started containers",
+            )
         else:
             self.log.warning("No containers started.")
 
