@@ -42,6 +42,7 @@ class ConsoleLogger:
         self.json_mode = json_mode
         self.no_color = self._resolve_no_color(no_color)
         self.console = Console(no_color=self.no_color, highlight=False)
+        self._active_loading = None
         self._fh = None
         if log_file_path:
             try:
@@ -193,6 +194,22 @@ class ConsoleLogger:
         self._write_file("process", f"START: {message}")
         return LoadingContext(self, message)
 
+    def print_stream(self, text):
+        if not self._should_print("process"):
+            return
+        kwargs = {
+            "markup": False,
+            "highlight": False,
+            "overflow": "fold",
+            "crop": False,
+            "soft_wrap": True,
+        }
+        loading = self._active_loading
+        if loading is not None and loading.progress is not None:
+            loading.progress.console.print(text, **kwargs)
+            return
+        self.console.print(text, **kwargs)
+
     def close(self):
         if self._fh:
             try:
@@ -218,13 +235,18 @@ class LoadingContext:
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             transient=True,
-            console=Console(stderr=True, no_color=self.logger.no_color, highlight=False),
+            console=self.logger.console,
+            redirect_stdout=False,
+            redirect_stderr=False,
         )
         self.progress.start()
         self.task = self.progress.add_task(description=self.message, total=None)
+        self.logger._active_loading = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if getattr(self.logger, "_active_loading", None) is self:
+            self.logger._active_loading = None
         if self.progress:
             self.progress.stop()
         status = "OK" if exc_type is None else f"ERROR: {exc_val}"

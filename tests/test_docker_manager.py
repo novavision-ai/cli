@@ -146,6 +146,31 @@ def test_run_docker_compose_prints_final_progress_line_to_console(fake_logger, t
     assert printed == ["100%", "Done"]
 
 
+def test_run_docker_compose_uses_print_stream(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    fake_logger.log_file_path = str(tmp_path / "install.log")
+    fake_logger.print_stream = Mock()
+    manager = DockerManager(logger=fake_logger)
+    process = _FakeComposeProcess(b"#20 DONE 92.1s\n")
+
+    with patch("novavision.docker_manager.shutil.which", side_effect=lambda name: name == "docker"):
+        with patch("novavision.docker_manager.subprocess.Popen", return_value=process):
+            manager.run_docker_compose(compose_file, "build", "--no-cache")
+
+    fake_logger.print_stream.assert_called_once_with("#20 DONE 92.1s")
+
+
+def test_write_compose_console_does_not_crop_lines(fake_logger):
+    fake_logger.console = Mock()
+    manager = DockerManager(logger=fake_logger)
+    long_line = "Successfully installed " + ("package " * 40)
+    manager._write_compose_console(long_line)
+    kwargs = fake_logger.console.print.call_args.kwargs
+    assert kwargs.get("crop") is False
+    assert kwargs.get("soft_wrap") is True
+
+
 def test_run_docker_compose_skips_blank_ansi_progress_lines(fake_logger, tmp_path):
     compose_file = tmp_path / "docker-compose.yml"
     compose_file.write_text("services: {}\n", encoding="utf-8")

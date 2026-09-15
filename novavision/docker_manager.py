@@ -545,15 +545,19 @@ class DockerManager:
     def _write_compose_console(self, text):
         if getattr(self.log, "quiet", False) or getattr(self.log, "json_mode", False):
             return
+        print_stream = getattr(self.log, "print_stream", None)
+        if callable(print_stream):
+            print_stream(text)
+            return
         console = getattr(self.log, "console", None)
         if console is not None:
             console.print(
                 text,
                 markup=False,
                 highlight=False,
-                overflow="ignore",
-                crop=True,
-                soft_wrap=False,
+                overflow="fold",
+                crop=False,
+                soft_wrap=True,
             )
             return
         sys.stdout.write(text + "\n")
