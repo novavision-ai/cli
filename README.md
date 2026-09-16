@@ -37,7 +37,7 @@ novavision install [edge|local|cloud] <USER_TOKEN> --host <HOST> --workspace <US
 **Parameters**  
 - `DEVICE_TYPE`: Specifies the server type. Options: `edge`, `local`, or `cloud`.  
 - `USER_TOKEN`: User token required for registering and installing the server.
-- `--host`: User can specify which host will be used for creating device. Default: `alfa.suite.novavision.ai`. Choices: `alfa.suite.novavision.ai | suite.novavision.ai`
+- `--host`: Suite host URL. Default: `https://suite.novavision.ai` (or `host` in `~/.novavision/config.json`). Common values: `suite.novavision.ai`, `alfa.suite.novavision.ai`.
 - `--workspace`: User can specify which workspace will be used for creating device. User must type the name of the workspace they have. If this parameter is not entered, workspace selection will be performed while device creation. 
 - `--port`: Server API port. Skips the port prompt when set.
 - `--non-interactive`: Skip prompts. Requires `--workspace`. Uses port `7001` if `--port` is omitted. Fails instead of asking which device to delete when the account is at its device limit.
@@ -54,6 +54,39 @@ novavision uninstall server <USER_TOKEN> --id <SERVER_ID>
 **Parameters**  
 - `USER_TOKEN`: User token required to delete the device on the host.
 - `--id`: Server folder ID, or the device ID stored in server metadata.
+- `--yes`: Skip the uninstall confirmation prompt.
+
+Optional file `~/.novavision/config.json` can set default `"host"` and `"workspace"` values for `install`.
+
+---
+
+### **list**
+Shows installed servers, whether they are running, and their apps.
+
+```bash
+novavision list
+novavision list --json
+```
+
+---
+
+### **status**
+Shows running state for a server and its apps. Omit `--id` to show every server.
+
+```bash
+novavision status
+novavision status --id <SERVER_ID>
+```
+
+---
+
+### **logs**
+Shows Docker Compose logs for a server or app.
+
+```bash
+novavision logs server --id <SERVER_ID> --follow
+novavision logs app --id <APP_ID> --tail 100
+```
 
 ---
 
@@ -98,3 +131,5 @@ novavision service [enable|disable|status] server --id <SERVER_ID> --apps <APP_I
 - `--apps` *(Optional, enable only)*: App IDs to start after the server. Use `"*"` to start all apps.
 
 Linux requires sudo. Windows requires an Administrator terminal. On macOS and Windows, Docker Desktop must start automatically.
+
+Global flags: `-q` / `--quiet`, `--json` (for `list` and `status`), `--no-color` (also honors `NO_COLOR`).

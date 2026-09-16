@@ -41,6 +41,26 @@ class FakeLogger:
     def __init__(self, answers=None):
         self.messages = []
         self.answers = list(answers or [])
+        self.quiet = False
+        self.json_mode = False
+        self.no_color = False
+        self.log_file_path = None
+        self.json_payloads = []
+        self.tables = []
+
+    def configure(self, quiet=False, json_mode=False, no_color=None):
+        self.quiet = quiet
+        self.json_mode = json_mode
+        self.no_color = bool(no_color)
+
+    def copy_settings(self, log_file_path=None, append=False):
+        clone = FakeLogger(answers=self.answers)
+        clone.quiet = self.quiet
+        clone.json_mode = self.json_mode
+        clone.no_color = self.no_color
+        clone.log_file_path = log_file_path
+        clone.messages = self.messages
+        return clone
 
     def _record(self, level, message):
         self.messages.append((level, message))
@@ -62,6 +82,35 @@ class FakeLogger:
         if self.answers:
             return self.answers.pop(0)
         return "y"
+
+    def confirm(self, message, default=True):
+        self._record("question", message)
+        if self.answers:
+            answer = self.answers.pop(0)
+            if isinstance(answer, bool):
+                return answer
+            return str(answer).strip().lower() in ("y", "yes", "true", "1")
+        return default
+
+    def ask_index(self, prompt, count):
+        self._record("question", prompt)
+        if self.answers:
+            return int(str(self.answers.pop(0)).strip()) - 1
+        return 0
+
+    def step(self, current, total, message):
+        self._record("info", f"Step {current}/{total}: {message}")
+
+    def table(self, headers, rows, title=None):
+        self.tables.append({"headers": headers, "rows": rows, "title": title})
+        self._record("info", title or "table")
+
+    def emit_json(self, payload):
+        self.json_payloads.append(payload)
+        self._record("info", payload)
+
+    def write_raw(self, text):
+        self._record("process", text)
 
     def loading(self, message):
         self._record("process", message)

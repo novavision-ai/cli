@@ -69,6 +69,32 @@ def test_select_port_defaults_when_non_interactive(fake_logger, nv_home):
     assert installer._select_port() == "7001"
 
 
+def test_response_error_text_prefers_json_message(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    response = Mock()
+    response.status_code = 400
+    response.json.return_value = {"message": "bad token"}
+    response.text = '{"message": "bad token"}'
+    assert "bad token" in installer._response_error_text(response)
+    assert "400" in installer._response_error_text(response)
+
+
+def test_uninstall_confirm_cancels(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://suite.novavision.ai"}}',
+        encoding="utf-8",
+    )
+    fake_logger.answers = ["n"]
+    installer = Installer(logger=fake_logger)
+    installer.non_interactive = False
+    with patch.object(installer, "_delete_device") as delete_device:
+        assert installer.uninstall(token="ci-token", server_name="abcdef") is False
+    delete_device.assert_not_called()
+    assert server_folder.exists()
+
+
 def test_select_gpu_picks_first_when_non_interactive(fake_logger, nv_home):
     installer = Installer(logger=fake_logger)
     installer.non_interactive = True
@@ -108,8 +134,10 @@ def _write_enabled_server(nv_home):
     return server_folder
 
 
-def _interactive_installer(fake_logger, answer="y"):
-    fake_logger.answers = [answer]
+def _interactive_installer(fake_logger, answers=None, answer=None):
+    if answers is None:
+        answers = [answer, "y"] if answer is not None else ["y", "y"]
+    fake_logger.answers = list(answers)
     installer = Installer(logger=fake_logger)
     installer.non_interactive = False
     return installer
@@ -163,7 +191,7 @@ def test_uninstall_skips_disable_when_service_not_enabled(fake_logger, nv_home):
 
 def test_uninstall_stops_when_user_declines_service_disable(fake_logger, nv_home):
     server_folder = _write_enabled_server(nv_home)
-    installer = _interactive_installer(fake_logger, answer="n")
+    installer = _interactive_installer(fake_logger, answers=["y", "n"])
     with patch.object(installer.service, "_is_noninteractive", return_value=False):
         with patch.object(installer.service, "disable_server") as disable_server:
             with patch.object(installer, "_delete_device") as delete_device:

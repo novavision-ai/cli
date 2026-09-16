@@ -96,20 +96,10 @@ class Installer:
                 self.log.info("Multiple GPUs detected. Please select one GPU.")
                 for idx, gpu in enumerate(device_info["gpu"]):
                     self.log.info(f"{idx + 1}. {gpu}")
-                while True:
-                    try:
-                        choice = int(
-                            self.log.question("Please select a GPU to continue")
-                        )
-                        if 1 <= choice <= len(device_info["gpu"]):
-                            device_info["gpu"] = device_info["gpu"][choice - 1]
-                            break
-                        else:
-                            self.log.warning(
-                                "Invalid selection. Please select a number from the list."
-                            )
-                    except ValueError:
-                        self.log.warning("Invalid entry. Please enter a number.")
+                choice = self.log.ask_index(
+                    "Please select a GPU to continue", len(device_info["gpu"])
+                )
+                device_info["gpu"] = device_info["gpu"][choice]
             else:
                 device_info["gpu"] = (
                     device_info["gpu"][0] if device_info["gpu"] else "No GPU Detected"
@@ -146,17 +136,50 @@ class Installer:
         except requests.exceptions.RequestException as e:
             return e
 
+    def _response_error_text(self, response, fallback="Request failed"):
+        if response is None:
+            return fallback
+        if isinstance(response, Exception):
+            return str(response)
+
+        status = getattr(response, "status_code", None)
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error") or data.get("detail")
+                if isinstance(message, (dict, list)):
+                    message = str(message)
+                if message:
+                    suffix = f" (HTTP {status})" if status is not None else ""
+                    return f"{message}{suffix}"
+        except Exception:
+            pass
+
+        text = (getattr(response, "text", None) or "").strip()
+        if text:
+            if len(text) > 300:
+                text = text[:297] + "..."
+            suffix = f" (HTTP {status})" if status is not None else ""
+            return f"{text}{suffix}"
+        if status is not None:
+            return f"{fallback} (HTTP {status})"
+        return fallback
+
     def install(
         self, device_type, token, host, workspace, port=None, non_interactive=False
     ):
         self.non_interactive = bool(non_interactive)
         host = self.format_host(host)
         os.chdir(os.path.expanduser("~"))
+        total_steps = 8
 
+        self.log.step(1, total_steps, "Checking Docker")
         if not self.docker._check_docker_available():
             return False
+        self.log.step(2, total_steps, "Cleaning previous installations")
         self.docker._cleanup_previous_docker_installations()
 
+        self.log.step(3, total_steps, "Detecting hardware")
         device_info = get_system_info()
         if "error" in device_info:
             self.log.error(f"Error getting system info: {device_info['error']}")
@@ -164,14 +187,17 @@ class Installer:
 
         self._select_gpu(device_info)
 
+        self.log.step(4, total_steps, "Selecting workspace")
         workspace_selection = self._get_workspace_id(host, token, workspace)
         if not workspace_selection:
             return False
 
         workspace_user_id, workspace_name = workspace_selection
+        self.log.step(5, total_steps, "Setting workspace")
         if not self._set_workspace(host, token, workspace_user_id):
             return False
 
+        self.log.step(6, total_steps, "Selecting port")
         selected_port = self._select_port(port)
         if not selected_port:
             return False
@@ -180,6 +206,7 @@ class Installer:
         if not device_data:
             return False
 
+        self.log.step(7, total_steps, "Registering device")
         register_response = self._register_device(device_data, token, host, device_info)
         if register_response is None:
             return False
@@ -189,6 +216,7 @@ class Installer:
             Path(pending_key), register_response, host, workspace_name
         )
 
+        self.log.step(8, total_steps, "Downloading and building server")
         server_folder = self._setup_server(register_response, host)
         if not server_folder:
             return False
@@ -230,7 +258,8 @@ class Installer:
         try:
             if workspace_list_response.status_code != 200:
                 self.log.error(
-                    f"Workspace list request failed. Error: {workspace_list_response.json()['message']}"
+                    "Workspace list request failed. "
+                    f"{self._response_error_text(workspace_list_response)}"
                 )
                 return None
         except Exception as e:
@@ -275,28 +304,16 @@ class Installer:
             for idx, workspaces in enumerate(workspace_list):
                 workspace_info = workspaces.get("workspace", {})
                 workspace_name = workspace_info.get("name", "Unknown")
-                workspace_user_id = workspaces.get("id_workspace_user", "Unknown")
-                self.log.info(
-                    f"{idx + 1}. {workspace_name} (Workspace ID: {workspace_user_id})"
-                )
+                self.log.info(f"{idx + 1}. {workspace_name}")
 
-            while True:
-                try:
-                    choice = int(
-                        self.log.question("Please select a workspace to continue")
-                    )
-                    if 1 <= choice <= len(workspace_list):
-                        selected_workspace = workspace_list[choice - 1]
-                        workspace_name = selected_workspace.get("workspace", {}).get(
-                            "name", "Unknown"
-                        )
-                        return selected_workspace["id_workspace_user"], workspace_name
-                    else:
-                        self.log.warning(
-                            "Invalid selection. Please select a number from the list."
-                        )
-                except ValueError:
-                    self.log.warning("Invalid entry. Please enter a number.")
+            choice = self.log.ask_index(
+                "Please select a workspace to continue", len(workspace_list)
+            )
+            selected_workspace = workspace_list[choice]
+            workspace_name = selected_workspace.get("workspace", {}).get(
+                "name", "Unknown"
+            )
+            return selected_workspace["id_workspace_user"], workspace_name
         else:
             workspace_to_select = [
                 workspaces
@@ -334,7 +351,7 @@ class Installer:
                 return True
             else:
                 self.log.error(
-                    f"Workspace set failed! Error: {set_workspace_response.text}"
+                    f"Workspace set failed. {self._response_error_text(set_workspace_response)}"
                 )
                 return False
         except Exception as e:
@@ -353,29 +370,18 @@ class Installer:
             self.log.info("Non-interactive mode: using default port 7001.")
             return "7001"
 
+        if self.log.confirm("Use default port 7001?", default=True):
+            return "7001"
+
         while True:
-            user_port = (
-                self.log.question(
-                    "Default port is 7001. Would you like to use it? (y/n)"
-                )
-                .strip()
-                .lower()
-            )
-            if user_port == "y":
-                return "7001"
-            elif user_port == "n":
-                while True:
-                    entered = self.log.question("Please enter desired port").strip()
-                    if entered.isdigit():
-                        port_int = int(entered)
-                        if 1 <= port_int <= 65535:
-                            return str(port_int)
-                        else:
-                            self.log.warning("Port must be between 1 and 65535.")
-                    else:
-                        self.log.warning("Port must be a number.")
+            entered = self.log.question("Please enter desired port").strip()
+            if entered.isdigit():
+                port_int = int(entered)
+                if 1 <= port_int <= 65535:
+                    return str(port_int)
+                self.log.warning("Port must be between 1 and 65535.")
             else:
-                self.log.error("Invalid input.")
+                self.log.warning("Port must be a number.")
 
     def _prepare_device_data(self, device_type, device_info, port):
         base_data = {
@@ -399,19 +405,8 @@ class Installer:
                 self.log.info(f"Detected WAN HOST: {wan_host}")
                 if self.non_interactive:
                     self.log.info("Non-interactive mode: using detected WAN HOST.")
-                else:
-                    user_wan_ip = (
-                        self.log.question(
-                            "Would you like to use detected WAN HOST? (y/n)"
-                        )
-                        .strip()
-                        .lower()
-                    )
-
-                    if user_wan_ip == "n":
-                        wan_host = self.log.question("Enter WAN HOST").strip()
-                    elif user_wan_ip != "y":
-                        self.log.warning("Invalid input. Using detected WAN HOST...")
+                elif not self.log.confirm("Use detected WAN HOST?", default=True):
+                    wan_host = self.log.question("Enter WAN HOST").strip()
 
                 base_data.update(
                     {"device_type": self.DEVICE_TYPE_CLOUD, "wan_host": wan_host}
@@ -449,7 +444,8 @@ class Installer:
                 device_response = device_response.json()
             except ValueError:
                 self.log.error(
-                    f"Invalid response format received while fetching devices: {device_response.text}"
+                    f"Invalid response format received while fetching devices: "
+                    f"{self._response_error_text(device_response)}"
                 )
                 return None
 
@@ -541,27 +537,11 @@ class Installer:
                                         f"{idx + 1}. {device['name']} (Device type: {device_type})"
                                     )
 
-                                while True:
-                                    try:
-                                        choice = int(
-                                            self.log.question(
-                                                "Please select a device to remove"
-                                            )
-                                        )
-                                        if 1 <= choice <= len(device_response):
-                                            device_id_to_delete = device_response[
-                                                choice - 1
-                                            ]["id_device"]
-                                            break
-                                        else:
-                                            self.log.warning(
-                                                "Invalid selection. Please select a number from the list."
-                                            )
-                                    except ValueError:
-                                        self.log.warning(
-                                            "Invalid entry. Please enter a number."
-                                        )
-
+                                choice = self.log.ask_index(
+                                    "Please select a device to remove",
+                                    len(device_response),
+                                )
+                                device_id_to_delete = device_response[choice]["id_device"]
                                 self._delete_device(device_id_to_delete, host, token)
 
                             else:
@@ -580,7 +560,8 @@ class Installer:
 
                 else:
                     self.log.error(
-                        f"Unexpected error occurred during registration. Error:{register_response.text}"
+                        "Unexpected error occurred during registration. "
+                        f"{self._response_error_text(register_response)}"
                     )
             except Exception as e:
                 self.log.error(f"Error parsing registration response: {e}")
@@ -604,12 +585,11 @@ class Installer:
             return True
 
         self.log.error(
-            f"Device removal failed! Status: {delete_response.status_code} "
-            f"{getattr(delete_response, 'text', '')}"
+            f"Device removal failed. {self._response_error_text(delete_response)}"
         )
         return False
 
-    def uninstall(self, token, server_name=None):
+    def uninstall(self, token, server_name=None, assume_yes=False):
         if not server_name:
             if self.non_interactive:
                 self.log.error("Server id is required in non-interactive mode.")
@@ -630,6 +610,8 @@ class Installer:
                     break
 
         server_folder = Path.home() / ".novavision" / "Server" / folder_name
+        if not self._confirm_uninstall(folder_name, server_meta, assume_yes):
+            return False
         if not self._confirm_server_service_disabled(folder_name, server_meta):
             return False
 
@@ -668,6 +650,21 @@ class Installer:
 
         return True
 
+    def _confirm_uninstall(self, folder_name, server_meta, assume_yes):
+        if self.non_interactive or assume_yes:
+            return True
+
+        workspace = (server_meta or {}).get("workspace", "Unknown")
+        host = (server_meta or {}).get("host", "Unknown")
+        summary = (
+            f"Uninstall server {folder_name} (workspace: {workspace}, host: {host}). "
+            "This deletes the Suite device and the local folder."
+        )
+        if self.log.confirm(summary, default=False):
+            return True
+        self.log.error("Uninstall cancelled.")
+        return False
+
     def _confirm_server_service_disabled(self, folder_name, server_meta):
         service_meta = (server_meta or {}).get("service") or {}
         if not service_meta.get("enabled"):
@@ -681,15 +678,11 @@ class Installer:
             )
             return False
 
-        answer = (
-            self.log.question(
-                f"Server {folder_name} has a boot service enabled. "
-                "Disable it now so uninstall can continue? (y/n)"
-            )
-            .strip()
-            .lower()
-        )
-        if answer != "y":
+        if not self.log.confirm(
+            f"Server {folder_name} has a boot service enabled. "
+            "Disable it now so uninstall can continue?",
+            default=True,
+        ):
             self.log.error(
                 f"Uninstall cancelled. Disable the service first: {disable_cmd}"
             )
@@ -766,7 +759,8 @@ class Installer:
 
             if not server_response or server_response.status_code != 200:
                 self.log.error(
-                    f"Failed to get server package: {server_response.text if server_response else 'No response'}"
+                    "Failed to get server package. "
+                    f"{self._response_error_text(server_response, fallback='No response')}"
                 )
                 return
 
@@ -862,7 +856,6 @@ class Installer:
                 self.log.error(f"No docker-compose.yml found in {agent_folder}!")
                 return False
 
-            # Docker compose build işlemini başlat
             with self.log.loading("Building server"):
                 self.docker.run_docker_compose(compose_file, "build", "--no-cache")
 
@@ -893,7 +886,8 @@ class Installer:
                     self.log.success("Deployment status updated successfully!")
                 else:
                     self.log.error(
-                        f"Failed to update deployment status: {deploy_response.text}"
+                        "Failed to update deployment status. "
+                        f"{self._response_error_text(deploy_response)}"
                     )
             else:
                 self.log.error("Deployment status update request failed.")
