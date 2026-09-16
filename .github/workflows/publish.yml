@@ -55,6 +55,7 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           RAW_RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
