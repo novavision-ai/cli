@@ -98,17 +98,35 @@ class ServiceManager:
         service_metadata = metadata.get("service", {})
         enabled = service_metadata.get("enabled", False)
 
-        self.log.info(f"Server: {server_folder.name}")
-        self.log.info(f"Service: {'enabled' if enabled else 'disabled'}")
-        self.log.info(f"Provider: {service_metadata.get('provider', provider)}")
-        self.log.info(f"Name: {service_metadata.get('name', service_name)}")
         apps = service_metadata.get("apps") or []
         if apps == ["*"]:
-            self.log.info("Apps: all")
+            apps_text = "all"
         elif apps:
-            self.log.info("Apps: " + ", ".join(apps))
+            apps_text = ", ".join(apps)
         else:
-            self.log.info("Apps: none")
+            apps_text = "none"
+
+        payload = {
+            "server": server_folder.name,
+            "service": "enabled" if enabled else "disabled",
+            "provider": service_metadata.get("provider", provider),
+            "name": service_metadata.get("name", service_name),
+            "apps": apps_text,
+        }
+        if getattr(self.log, "json_mode", False):
+            self.log.emit_json(payload)
+        else:
+            self.log.table(
+                ["Field", "Value"],
+                [
+                    ["Server", payload["server"]],
+                    ["Service", payload["service"]],
+                    ["Provider", payload["provider"]],
+                    ["Name", payload["name"]],
+                    ["Apps", payload["apps"]],
+                ],
+                title="Boot service",
+            )
         return self._status_native_service(service_name)
 
     def run_service_action(self, action, server_name):
@@ -476,16 +494,11 @@ shell.Run command, 0, False
             )
             return True
 
-        answer = (
-            self.log.question(
-                f"Docker Desktop must be configured to start automatically on {os_name}. "
-                "Is Docker Desktop startup enabled? (y/n)"
-            )
-            .strip()
-            .lower()
-        )
-
-        if answer == "y":
+        if self.log.confirm(
+            f"Docker Desktop must be configured to start automatically on {os_name}. "
+            "Is Docker Desktop startup enabled?",
+            default=True,
+        ):
             return True
 
         self.log.error(

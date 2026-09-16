@@ -80,3 +80,44 @@ def test_service_enable_with_apps():
     assert args.action == "enable"
     assert args.id == "ci-server"
     assert args.apps == ["demo"]
+
+
+def test_list_and_status_and_logs_parse():
+    parser = _parser()
+    assert parser.parse_args(["list"]).command == "list"
+    status = parser.parse_args(["status", "--id", "abcdef"])
+    assert status.command == "status"
+    assert status.id == "abcdef"
+    logs = parser.parse_args(
+        ["logs", "server", "--id", "abcdef", "--follow", "--tail", "20"]
+    )
+    assert logs.command == "logs"
+    assert logs.type == "server"
+    assert logs.follow is True
+    assert logs.tail == 20
+
+
+def test_global_flags_and_uninstall_yes():
+    parser = _parser()
+    listed = parser.parse_args(["list", "--json", "--quiet", "--no-color"])
+    assert listed.json_mode is True
+    assert listed.quiet is True
+    assert listed.no_color is True
+    uninstall = parser.parse_args(
+        ["uninstall", "server", "ci-token", "--id", "abcdef", "--yes"]
+    )
+    assert uninstall.yes is True
+
+
+def test_install_host_defaults_to_none_before_config_merge():
+    args = _parser().parse_args(["install", "local", "ci-token"])
+    assert args.host is None
+    assert args.workspace is None
+
+
+def test_internal_metrics_parser():
+    parser = NovaVisionCLI()._create_internal_metrics_parser()
+    args = parser.parse_args(["serve", "--port", "18765", "--interval", "2"])
+    assert args.action == "serve"
+    assert args.port == 18765
+    assert args.interval == 2.0
