@@ -7,6 +7,12 @@ from novavision.config import DEFAULT_HOST, resolve_install_defaults
 from novavision.logger import ConsoleLogger
 from novavision.installer import Installer
 from novavision.docker_manager import DockerManager
+from novavision.host_metrics import (
+    DEFAULT_BIND,
+    DEFAULT_INTERVAL,
+    DEFAULT_PORT,
+    serve_host_metrics,
+)
 from novavision.service_manager import ServiceManager
 
 logger = ConsoleLogger()
@@ -185,9 +191,7 @@ class NovaVisionCLI:
         )
 
     def _add_list_parser(self, subparsers, parent):
-        subparsers.add_parser(
-            "list", help="List installed servers", parents=[parent]
-        )
+        subparsers.add_parser("list", help="List installed servers", parents=[parent])
 
     def _add_status_parser(self, subparsers, parent):
         status_parser = subparsers.add_parser(
@@ -229,6 +233,22 @@ class NovaVisionCLI:
         service_parser.add_argument("--server", required=True, help=argparse.SUPPRESS)
         return service_parser
 
+    def _create_internal_metrics_parser(self):
+        metrics_parser = argparse.ArgumentParser(
+            prog="novavision _metrics", description=argparse.SUPPRESS
+        )
+        metrics_parser.add_argument("action", choices=["serve"], help=argparse.SUPPRESS)
+        metrics_parser.add_argument(
+            "--port", type=int, default=DEFAULT_PORT, help=argparse.SUPPRESS
+        )
+        metrics_parser.add_argument(
+            "--bind", default=DEFAULT_BIND, help=argparse.SUPPRESS
+        )
+        metrics_parser.add_argument(
+            "--interval", type=float, default=DEFAULT_INTERVAL, help=argparse.SUPPRESS
+        )
+        return metrics_parser
+
     def _apply_logger_settings(self, args):
         logger.configure(
             quiet=getattr(args, "quiet", False),
@@ -239,7 +259,9 @@ class NovaVisionCLI:
     def handle_install(self, args):
         log_dir = Path.home() / ".novavision"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"install-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        log_file = (
+            log_dir / f"install-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        )
         install_logger = logger.copy_settings(log_file_path=str(log_file))
         install_logger.info(f"Logging installation to {log_file}")
         self.installer = Installer(logger=install_logger)
@@ -351,11 +373,26 @@ class NovaVisionCLI:
         if not success:
             raise SystemExit(1)
 
+    def handle_internal_metrics_command(self, args):
+        raise SystemExit(
+            serve_host_metrics(
+                port=args.port,
+                bind=args.bind,
+                interval=args.interval,
+            )
+        )
+
     def run(self):
         if len(sys.argv) > 1 and sys.argv[1] == "_service":
             parser = self._create_internal_service_parser()
             args = parser.parse_args(sys.argv[2:])
             self.handle_internal_service_command(args)
+            return
+
+        if len(sys.argv) > 1 and sys.argv[1] == "_metrics":
+            parser = self._create_internal_metrics_parser()
+            args = parser.parse_args(sys.argv[2:])
+            self.handle_internal_metrics_command(args)
             return
 
         parser = self.create_parser()

@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from rich.markup import escape
+from novavision.host_metrics import start_host_metrics, stop_host_metrics
 from novavision.logger import ConsoleLogger
 
 # CSI / OSC sequences from BuildKit and pip progress bars.
@@ -189,7 +190,9 @@ class DockerManager:
         metadata = self._load_server_metadata()
         records = [self._server_record(folder, metadata) for folder in folders]
         if getattr(self.log, "json_mode", False):
-            self.log.emit_json([self._plain_server_record(record) for record in records])
+            self.log.emit_json(
+                [self._plain_server_record(record) for record in records]
+            )
             return True
         self._print_server_table(records)
         return True
@@ -201,7 +204,9 @@ class DockerManager:
                 return False
             folders = [folder]
         else:
-            folders = self._visible_server_folders(Path.home() / ".novavision" / "Server")
+            folders = self._visible_server_folders(
+                Path.home() / ".novavision" / "Server"
+            )
             if not folders:
                 self.log.error("No server folders found!")
                 return False
@@ -216,7 +221,9 @@ class DockerManager:
                     "id": app_name,
                     "running": self._compose_is_running(compose_file),
                 }
-                for app_name, compose_file in self._server_app_compose_files(folder).items()
+                for app_name, compose_file in self._server_app_compose_files(
+                    folder
+                ).items()
             ]
             plain = self._plain_server_record(record)
             plain["apps"] = apps
@@ -338,7 +345,11 @@ class DockerManager:
             self.log.error(f"No docker-compose.yml found in {server_folder}!")
             return False
 
-        return self._start_server(docker_compose_file)
+        start_host_metrics(self.log)
+        started = self._start_server(docker_compose_file)
+        if not started:
+            self._stop_host_metrics_if_idle()
+        return started
 
     def stop_server_folder(self, server_folder):
         if not server_folder:
@@ -354,9 +365,11 @@ class DockerManager:
             self.log.success("Server stopped.")
             if self.remove_network():
                 self.log.success("Server network removed successfully.")
+            self._stop_host_metrics_if_idle()
             return True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             self.log.error(f"Error stopping server: {e}")
+            self._stop_host_metrics_if_idle()
             return False
 
     def remove_network(self):
@@ -409,7 +422,12 @@ class DockerManager:
             return None
 
     def manage_docker(
-        self, command, type, app_name=None, select_server=True, close_apps=False,
+        self,
+        command,
+        type,
+        app_name=None,
+        select_server=True,
+        close_apps=False,
         server_name=None,
     ):
         default_path = Path.home() / ".novavision"
@@ -428,19 +446,10 @@ class DockerManager:
                     ]
                     started = True
                     for folder in server_folders:
-                        docker_compose_file = folder / "docker-compose.yml"
-                        if docker_compose_file.exists():
-                            try:
-                                self.run_docker_compose(docker_compose_file, "up", "-d")
-                            except subprocess.CalledProcessError as e:
-                                self.log.error(
-                                    f"Error starting server {folder.name}: {e}"
-                                )
-                                started = False
+                        if not self.start_server_folder(folder):
+                            started = False
                     return started
-                server_folder = server_folder or self.choose_server_folder(
-                    server_path
-                )
+                server_folder = server_folder or self.choose_server_folder(server_path)
                 return self.start_server_folder(server_folder)
             elif type == "app":
                 return self._start_app(app_name)
@@ -518,7 +527,9 @@ class DockerManager:
             if not chunk:
                 break
             chunks.append(chunk)
-            self.log.write_raw(chunk.decode("utf-8", errors="replace").replace("\r", "\n"))
+            self.log.write_raw(
+                chunk.decode("utf-8", errors="replace").replace("\r", "\n")
+            )
             pending += chunk
             pending = self._echo_compose_lines(pending)
         if pending:
@@ -663,6 +674,13 @@ class DockerManager:
         if not server_folder:
             return False
         return self._compose_is_running(Path(server_folder) / "docker-compose.yml")
+
+    def _stop_host_metrics_if_idle(self):
+        server_path = Path.home() / ".novavision" / "Server"
+        for folder in self._visible_server_folders(server_path):
+            if self._server_is_running(folder):
+                return
+        stop_host_metrics(self.log)
 
     def _require_running_server_for_app(self, app_name):
         server_folder, compose_file = self._find_app(app_name)
@@ -825,6 +843,7 @@ class DockerManager:
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     self.log.error(f"Error stopping server {folder.name}: {e}")
                     stopped = False
+        self._stop_host_metrics_if_idle()
         return stopped
 
     def _stop_app(self, app_name):

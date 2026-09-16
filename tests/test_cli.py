@@ -88,7 +88,9 @@ def test_list_and_status_and_logs_parse():
     status = parser.parse_args(["status", "--id", "abcdef"])
     assert status.command == "status"
     assert status.id == "abcdef"
-    logs = parser.parse_args(["logs", "server", "--id", "abcdef", "--follow", "--tail", "20"])
+    logs = parser.parse_args(
+        ["logs", "server", "--id", "abcdef", "--follow", "--tail", "20"]
+    )
     assert logs.command == "logs"
     assert logs.type == "server"
     assert logs.follow is True
@@ -111,3 +113,11 @@ def test_install_host_defaults_to_none_before_config_merge():
     args = _parser().parse_args(["install", "local", "ci-token"])
     assert args.host is None
     assert args.workspace is None
+
+
+def test_internal_metrics_parser():
+    parser = NovaVisionCLI()._create_internal_metrics_parser()
+    args = parser.parse_args(["serve", "--port", "18765", "--interval", "2"])
+    assert args.action == "serve"
+    assert args.port == 18765
+    assert args.interval == 2.0
