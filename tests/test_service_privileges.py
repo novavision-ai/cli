@@ -123,3 +123,21 @@ def test_docker_desktop_startup_rejects_when_not_enabled(fake_logger, nv_home, m
     service = ServiceManager(logger=fake_logger)
     assert service._confirm_docker_desktop_startup("Windows") is False
     assert any("Docker Desktop" in message for message in fake_logger.messages_of("error"))
+
+
+def test_run_service_action_starts_boot_stack_with_apps(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision").mkdir(exist_ok=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"service": {"enabled": true, "apps": ["demo"]}}}',
+        encoding="utf-8",
+    )
+    docker = Mock()
+    docker.get_server_folder.return_value = server_folder
+    docker.start_boot_stack.return_value = True
+    service = ServiceManager(logger=fake_logger, docker_manager=docker)
+    assert service.run_service_action("start-server", "abcdef") is True
+    docker.start_boot_stack.assert_called_once_with(server_folder, ["demo"])
+    docker.wait_for_docker.assert_not_called()
+    docker.start_server_apps.assert_not_called()

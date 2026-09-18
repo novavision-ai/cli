@@ -135,10 +135,6 @@ class ServiceManager:
             return False
 
         if action == "start-server":
-            if not self.docker.wait_for_docker():
-                return False
-            if not self.docker.start_server_folder(server_folder):
-                return False
             apps = (
                 self._load_metadata()
                 .get(server_name, {})
@@ -146,8 +142,7 @@ class ServiceManager:
                 .get("apps")
                 or []
             )
-            self.docker.start_server_apps(server_folder, apps)
-            return True
+            return self.docker.start_boot_stack(server_folder, apps)
         if action == "stop-server":
             return self.docker.stop_server_folder(server_folder)
 

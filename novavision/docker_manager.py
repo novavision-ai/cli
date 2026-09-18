@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import socket
 import sys
 import yaml
 import shutil
@@ -23,6 +24,15 @@ _ANSI_ESCAPE = re.compile(
 class DockerManager:
     STATUS_MARK = "●"
     ASCII_STATUS_MARK = "*"
+    BOOT_START_RETRIES = 3
+    BOOT_RETRY_DELAY_SECONDS = 5
+    STACK_READY_TIMEOUT_SECONDS = 180
+    STACK_READY_INTERVAL_SECONDS = 2
+    NVIDIA_WAIT_TIMEOUT_SECONDS = 120
+    READY_PORT_KEYS = (
+        "DIGINOVA_WSL_SERVICE_PORT",
+        "DIGINOVA_MEDIA_SERVICE_PORT",
+    )
 
     MONTHS = [
         "Jan",
@@ -336,7 +346,7 @@ class DockerManager:
             return server_folder
         return self.choose_server_folder(server_path)
 
-    def start_server_folder(self, server_folder):
+    def start_server_folder(self, server_folder, retries=1):
         if not server_folder:
             return False
 
@@ -346,7 +356,7 @@ class DockerManager:
             return False
 
         start_host_metrics(self.log)
-        started = self._start_server(docker_compose_file)
+        started = self._start_server(docker_compose_file, retries=retries)
         if not started:
             self._stop_host_metrics_if_idle()
         return started
@@ -473,27 +483,119 @@ class DockerManager:
             return ["docker-compose"]
         return None
 
-    def run_docker_compose(self, compose_file, *args, capture=None):
+    def _compose_invocation(
+        self, compose_file, *args, extra_global=None, extra_files=None
+    ):
         compose_command = self._docker_compose_command()
         if not compose_command:
-            raise FileNotFoundError("Docker Compose is not available.")
+            return None
 
+        compose_file = Path(compose_file)
+        command = list(compose_command)
+        if extra_global:
+            command.extend(extra_global)
+        command.extend(
+            [
+                "--project-directory",
+                str(compose_file.parent),
+                "-f",
+                str(compose_file),
+            ]
+        )
+        for extra_file in extra_files or []:
+            command.extend(["-f", str(extra_file)])
+        command.extend(args)
+        return command
+
+    def _load_compose_yaml(self, compose_file):
+        compose_file = Path(compose_file) if compose_file else None
+        if not compose_file or not compose_file.exists():
+            return {}
+        try:
+            return yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+
+    def _docker_network_names(self):
+        result = subprocess.run(
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            return set()
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    def _external_networks_override(self, compose_file):
+        compose_file = Path(compose_file)
+        existing = self._docker_network_names()
+        override_networks = {}
+        for key, config in (
+            self._load_compose_yaml(compose_file).get("networks") or {}
+        ).items():
+            if not isinstance(config, dict):
+                config = {}
+            if config.get("external") is True or isinstance(
+                config.get("external"), dict
+            ):
+                continue
+            name = str(config.get("name") or key)
+            if name not in existing:
+                continue
+            override_networks[key] = {"name": name, "external": True}
+
+        override_path = compose_file.parent / ".novavision-compose.networks.yml"
+        if not override_networks:
+            try:
+                override_path.unlink()
+            except OSError:
+                pass
+            return None
+
+        override_path.write_text(
+            yaml.safe_dump(
+                {"networks": override_networks},
+                default_flow_style=False,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        self.log.info(
+            "Using existing Docker networks: "
+            + ", ".join(item["name"] for item in override_networks.values())
+        )
+        return override_path
+
+    def run_docker_compose(self, compose_file, *args, capture=None):
         should_capture = capture
         if should_capture is None:
             should_capture = bool(getattr(self.log, "log_file_path", None)) and (
                 not args or args[0] != "logs"
             )
 
-        command = list(compose_command)
+        extra_global = None
+        extra_files = None
+        compose_command = self._docker_compose_command()
         if (
             should_capture
             and args
             and args[0] == "build"
+            and compose_command
             and compose_command[:2] == ["docker", "compose"]
         ):
-            command.extend(["--progress", "plain"])
-        command.extend(["-f", str(compose_file)])
-        command.extend(args)
+            extra_global = ["--progress", "plain"]
+        if args and args[0] == "up":
+            override = self._external_networks_override(compose_file)
+            if override:
+                extra_files = [override]
+
+        command = self._compose_invocation(
+            compose_file, *args, extra_global=extra_global, extra_files=extra_files
+        )
+        if not command:
+            raise FileNotFoundError("Docker Compose is not available.")
 
         if not should_capture:
             subprocess.run(command, check=True)
@@ -574,7 +676,9 @@ class DockerManager:
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
 
-    def wait_for_docker(self, timeout_seconds=300, interval_seconds=5):
+    def wait_for_docker(
+        self, timeout_seconds=300, interval_seconds=5, compose_files=None
+    ):
         if not shutil.which("docker"):
             self.log.error("Docker is not installed. Please install Docker first.")
             return False
@@ -597,27 +701,296 @@ class DockerManager:
                 return False
 
         self.log.success("Docker is available.")
+        if compose_files and any(
+            self._compose_uses_nvidia(compose_file) for compose_file in compose_files
+        ):
+            return self._wait_for_nvidia_runtime(
+                timeout_seconds=self.NVIDIA_WAIT_TIMEOUT_SECONDS,
+                interval_seconds=interval_seconds,
+            )
         return True
 
-    def _start_server(self, docker_compose_file, label="server"):
+    def _compose_uses_nvidia(self, compose_file):
+        for config in (
+            self._load_compose_yaml(compose_file).get("services") or {}
+        ).values():
+            if isinstance(config, dict) and str(config.get("runtime", "")).lower() == "nvidia":
+                return True
+        return False
+
+    def _wait_for_nvidia_runtime(self, timeout_seconds=120, interval_seconds=5):
+        deadline = time.time() + timeout_seconds
+        with self.log.loading("Waiting for NVIDIA Docker runtime"):
+            while time.time() < deadline:
+                result = subprocess.run(
+                    ["docker", "info", "--format", "{{json .Runtimes}}"],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and "nvidia" in (result.stdout or "").lower():
+                    break
+                time.sleep(interval_seconds)
+            else:
+                self.log.error(
+                    "NVIDIA Docker runtime did not become available within "
+                    f"{timeout_seconds} seconds."
+                )
+                return False
+
+        self.log.success("NVIDIA Docker runtime is available.")
+        return True
+
+    def _read_env_file(self, folder):
+        env_path = Path(folder) / ".env" if folder else None
+        if not env_path or not env_path.exists():
+            return {}
+
+        values = {}
+        try:
+            for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+        except OSError:
+            return {}
+        return values
+
+    def _compose_service_containers(self, compose_file):
+        compose_file = Path(compose_file)
+        env = self._read_env_file(compose_file.parent)
+        containers = []
+        for service, config in (
+            self._load_compose_yaml(compose_file).get("services") or {}
+        ).items():
+            if not isinstance(config, dict):
+                continue
+            name = str(config.get("container_name") or service)
+            name = re.sub(
+                r"\$\{([^}]+)\}",
+                lambda match: str(env.get(match.group(1), match.group(0))),
+                name,
+            )
+            containers.append((service, name))
+        return containers
+
+    def _container_running_state(self, name):
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip().lower() == "true"
+
+    def _named_containers_running(self, compose_file):
+        return all(
+            self._container_running_state(name) is True
+            for _, name in self._compose_service_containers(compose_file)
+        )
+
+    def _start_existing_named_containers(self, compose_file):
+        missing = []
+        for service, name in self._compose_service_containers(compose_file):
+            running = self._container_running_state(name)
+            if running is None:
+                missing.append(service)
+                continue
+            if running:
+                self.log.info(f"Container {name} is already running.")
+                continue
+            self.log.info(f"Starting existing container {name}")
+            result = subprocess.run(
+                ["docker", "start", name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode == 0:
+                continue
+            detail = (result.stderr or result.stdout or "").strip()
+            self.log.warning(
+                f"Could not start existing container {name}; recreating it."
+                + (f" {detail}" if detail else "")
+            )
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            missing.append(service)
+        return missing
+
+    def _ready_ports(self, folder):
+        env = self._read_env_file(folder)
+        ports = []
+        for key in self.READY_PORT_KEYS:
+            value = env.get(key)
+            if not value:
+                continue
+            try:
+                ports.append((key, int(value)))
+            except (TypeError, ValueError):
+                self.log.warning(f"Ignoring invalid {key} value: {value}")
+        return ports
+
+    def _tcp_port_open(self, host, port, timeout=0.5):
+        try:
+            with socket.create_connection((str(host), int(port)), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def wait_for_stack_ready(
+        self,
+        compose_file,
+        label="stack",
+        folder=None,
+        timeout_seconds=None,
+        interval_seconds=None,
+    ):
+        if not compose_file or not Path(compose_file).exists():
+            return False
+
+        timeout_seconds = (
+            self.STACK_READY_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        interval_seconds = (
+            self.STACK_READY_INTERVAL_SECONDS
+            if interval_seconds is None
+            else interval_seconds
+        )
+        folder = Path(folder) if folder else Path(compose_file).parent
+        ports = self._ready_ports(folder)
+        deadline = time.time() + timeout_seconds
+
+        with self.log.loading(f"Waiting for {label} to become ready"):
+            while time.time() < deadline:
+                ports_ready = all(
+                    self._tcp_port_open("127.0.0.1", port) for _, port in ports
+                )
+                if self._named_containers_running(compose_file) and ports_ready:
+                    break
+                time.sleep(interval_seconds)
+            else:
+                waiting_for = []
+                if not self._named_containers_running(compose_file):
+                    waiting_for.append("containers")
+                for key, port in ports:
+                    if not self._tcp_port_open("127.0.0.1", port):
+                        waiting_for.append(f"{key} ({port})")
+                detail = ", ".join(waiting_for) or "services"
+                self.log.error(
+                    f"{label} did not become ready within {timeout_seconds} seconds "
+                    f"({detail})."
+                )
+                return False
+
+        self.log.success(f"{label} is ready.")
+        return True
+
+    def start_boot_stack(self, server_folder, app_names=None):
+        if not server_folder:
+            return False
+
+        server_compose = Path(server_folder) / "docker-compose.yml"
+        app_files = self._server_app_compose_files(server_folder)
+        compose_files = [server_compose]
+        if app_names:
+            if "*" in app_names:
+                compose_files.extend(app_files.values())
+            else:
+                compose_files.extend(
+                    app_files[name] for name in app_names if name in app_files
+                )
+
+        if not self.wait_for_docker(compose_files=compose_files):
+            return False
+        if not self.start_server_folder(
+            server_folder, retries=self.BOOT_START_RETRIES
+        ):
+            return False
+        if not self.wait_for_stack_ready(
+            server_compose,
+            label=f"server {Path(server_folder).name}",
+            folder=server_folder,
+        ):
+            return False
+        return self.start_server_apps(
+            server_folder,
+            app_names,
+            wait_ready=True,
+            retries=self.BOOT_START_RETRIES,
+        )
+
+    def _start_server(
+        self,
+        docker_compose_file,
+        label="server",
+        retries=1,
+        retry_delay=None,
+    ):
+        retries = max(1, int(retries or 1))
+        retry_delay = (
+            self.BOOT_RETRY_DELAY_SECONDS if retry_delay is None else retry_delay
+        )
         previous_containers = set(
             subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True)
             .stdout.strip()
             .split("\n")
         )
         self.log.info(f"Starting {label}")
-        try:
-            self.run_docker_compose(docker_compose_file, "up", "-d")
-            result = subprocess.run(
-                ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
-                capture_output=True,
-                text=True,
-            )
-            self._display_new_containers(result.stdout, previous_containers)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            self.log.error(f"Error starting {label}: {e}")
-            return False
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                missing_services = self._start_existing_named_containers(
+                    docker_compose_file
+                )
+                services = [
+                    service
+                    for service, _ in self._compose_service_containers(
+                        docker_compose_file
+                    )
+                ]
+                if missing_services or not services:
+                    up_args = ["up", "-d"]
+                    if (
+                        services
+                        and missing_services
+                        and len(missing_services) < len(services)
+                    ):
+                        up_args.extend(missing_services)
+                    self.run_docker_compose(docker_compose_file, *up_args)
+                else:
+                    self.log.info(
+                        f"All {label} containers already exist; started them in place."
+                    )
+                result = subprocess.run(
+                    ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Ports}}"],
+                    capture_output=True,
+                    text=True,
+                )
+                self._display_new_containers(result.stdout, previous_containers)
+                return True
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                last_error = e
+                detail = (getattr(e, "stderr", None) or str(e)).strip()
+                if attempt < retries:
+                    self.log.warning(
+                        f"Retrying {label} start ({attempt}/{retries}): {detail}"
+                    )
+                    time.sleep(retry_delay)
+        self.log.error(f"Error starting {label}: {last_error}")
+        return False
 
     def _server_app_compose_files(self, server_folder):
         if not server_folder:
@@ -657,14 +1030,19 @@ class DockerManager:
         return matches[0]
 
     def _compose_is_running(self, compose_file):
-        compose_command = self._docker_compose_command()
-        if not compose_command or not compose_file or not Path(compose_file).exists():
+        if not compose_file or not Path(compose_file).exists():
+            return False
+
+        command = self._compose_invocation(compose_file, "ps", "-q")
+        if not command:
             return False
 
         result = subprocess.run(
-            compose_command + ["-f", str(compose_file), "ps", "-q"],
+            command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             return False
@@ -695,7 +1073,9 @@ class DockerManager:
             return None
         return compose_file
 
-    def start_server_apps(self, server_folder, app_names=None):
+    def start_server_apps(
+        self, server_folder, app_names=None, wait_ready=False, retries=1
+    ):
         if not app_names:
             return True
 
@@ -720,7 +1100,16 @@ class DockerManager:
 
         started = True
         for app_name, compose_file in selected.items():
-            if not self._start_server(compose_file, label=f"app {app_name}"):
+            if not self._start_server(
+                compose_file, label=f"app {app_name}", retries=retries
+            ):
+                started = False
+                continue
+            if wait_ready and not self.wait_for_stack_ready(
+                compose_file,
+                label=f"app {app_name}",
+                folder=compose_file.parent,
+            ):
                 started = False
         return started
 
@@ -731,14 +1120,19 @@ class DockerManager:
         return self._start_server(compose_file, label=f"app {app_name}")
 
     def _compose_container_ids(self, compose_file):
-        compose_command = self._docker_compose_command()
-        if not compose_command or not compose_file or not compose_file.exists():
+        if not compose_file or not Path(compose_file).exists():
+            return set()
+
+        command = self._compose_invocation(compose_file, "ps", "-a", "-q")
+        if not command:
             return set()
 
         result = subprocess.run(
-            compose_command + ["-f", str(compose_file), "ps", "-a", "-q"],
+            command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             return set()
@@ -863,7 +1257,11 @@ class DockerManager:
         current_containers = output.strip().split("\n")
         new_containers = []
         for container in current_containers:
+            if not container.strip():
+                continue
             parts = container.split(" ", 2)
+            if len(parts) < 2:
+                continue
             container_id = parts[0]
             container_name = parts[1]
             container_ports = parts[2] if len(parts) > 2 else "No ports"

@@ -2,6 +2,8 @@ import json
 import subprocess
 from unittest.mock import Mock, patch
 
+import yaml
+
 from novavision.docker_manager import DockerManager
 
 
@@ -264,8 +266,13 @@ def test_run_docker_compose_build_uses_plain_progress(fake_logger, tmp_path):
 
     command = popen.call_args[0][0]
     assert command[:4] == ["docker", "compose", "--progress", "plain"]
-    assert command[4:6] == ["-f", str(compose_file)]
-    assert command[6:] == ["build", "--no-cache"]
+    assert command[4:8] == [
+        "--project-directory",
+        str(tmp_path),
+        "-f",
+        str(compose_file),
+    ]
+    assert command[8:] == ["build", "--no-cache"]
 
 
 def test_run_docker_compose_capture_raises_on_failure(fake_logger, tmp_path):
@@ -416,3 +423,356 @@ def test_load_server_metadata(fake_logger, nv_home):
     )
     manager = DockerManager(logger=fake_logger)
     assert manager._load_server_metadata()["ci-server"]["workspace"] == "ci"
+
+
+def test_compose_invocation_sets_project_directory(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    with patch(
+        "novavision.docker_manager.shutil.which",
+        side_effect=lambda name: name == "docker",
+    ):
+        command = manager._compose_invocation(compose_file, "up", "-d")
+    assert command[:2] == ["docker", "compose"]
+    assert command[2:6] == [
+        "--project-directory",
+        str(tmp_path),
+        "-f",
+        str(compose_file),
+    ]
+    assert command[6:] == ["up", "-d"]
+
+
+def test_external_networks_override_marks_existing_named_networks(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services: {}\n"
+        "networks:\n"
+        "  app_net:\n"
+        "    name: c9844b-a3dad8-network-novavision\n"
+        "  common_net:\n"
+        "    name: c9844b-network-common-novavision\n"
+        "  missing_net:\n"
+        "    name: missing-network\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(
+        manager,
+        "_docker_network_names",
+        return_value={
+            "c9844b-a3dad8-network-novavision",
+            "c9844b-network-common-novavision",
+        },
+    ):
+        override = manager._external_networks_override(compose_file)
+    assert override is not None
+    data = yaml.safe_load(override.read_text(encoding="utf-8"))
+    assert data["networks"]["app_net"] == {
+        "name": "c9844b-a3dad8-network-novavision",
+        "external": True,
+    }
+    assert data["networks"]["common_net"]["external"] is True
+    assert "missing_net" not in data["networks"]
+
+
+def test_run_docker_compose_up_adds_external_network_override(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services: {}\nnetworks:\n  app_net:\n    name: app-net\n",
+        encoding="utf-8",
+    )
+    override = tmp_path / ".novavision-compose.networks.yml"
+    manager = DockerManager(logger=fake_logger)
+    with patch(
+        "novavision.docker_manager.shutil.which",
+        side_effect=lambda name: name == "docker",
+    ):
+        with patch.object(manager, "_external_networks_override", return_value=override):
+            with patch("novavision.docker_manager.subprocess.run") as run:
+                manager.run_docker_compose(compose_file, "up", "-d")
+    command = run.call_args[0][0]
+    assert command.count("-f") == 2
+    assert str(override) in command
+    assert command[-2:] == ["up", "-d"]
+
+
+def test_compose_uses_nvidia(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n  media:\n    image: alpine\n    runtime: nvidia\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    assert manager._compose_uses_nvidia(compose_file) is True
+    compose_file.write_text("services:\n  redis:\n    image: alpine\n", encoding="utf-8")
+    assert manager._compose_uses_nvidia(compose_file) is False
+
+
+def test_wait_for_docker_waits_for_nvidia_when_compose_needs_it(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n  media:\n    image: alpine\n    runtime: nvidia\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    runtime_calls = {"count": 0}
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "info"] and "--format" in args:
+            runtime_calls["count"] += 1
+            stdout = '{"nvidia":{}}' if runtime_calls["count"] > 1 else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch("novavision.docker_manager.shutil.which", return_value="/bin/docker"):
+        with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+            with patch("novavision.docker_manager.time.sleep"):
+                assert manager.wait_for_docker(compose_files=[compose_file]) is True
+    assert runtime_calls["count"] == 2
+
+
+def test_wait_for_stack_ready_waits_for_wsl_and_media_ports(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  wsl:\n    image: alpine\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "DIGINOVA_WSL_SERVICE_PORT=6525\nDIGINOVA_MEDIA_SERVICE_PORT=8817\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    opened = set()
+
+    def fake_port(host, port, timeout=0.5):
+        opened.add(int(port))
+        return True
+
+    with patch.object(manager, "_named_containers_running", return_value=True):
+        with patch.object(manager, "_tcp_port_open", side_effect=fake_port):
+            assert (
+                manager.wait_for_stack_ready(
+                    compose_file, label="app demo", folder=tmp_path
+                )
+                is True
+            )
+    assert opened == {6525, 8817}
+
+
+def test_wait_for_stack_ready_fails_when_containers_never_run(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n  diginova-media:\n    image: alpine\n", encoding="utf-8"
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_named_containers_running", return_value=False):
+        with patch("novavision.docker_manager.time.sleep"):
+            assert (
+                manager.wait_for_stack_ready(
+                    compose_file,
+                    label="app demo",
+                    folder=tmp_path,
+                    timeout_seconds=1,
+                    interval_seconds=0,
+                )
+                is False
+            )
+    assert any(
+        "did not become ready" in message for message in fake_logger.messages_of("error")
+    )
+
+
+def test_start_boot_stack_does_not_start_apps_until_server_ready(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "ci-server"
+    app_folder = server_folder / "demo"
+    app_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    (app_folder / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "wait_for_docker", return_value=True):
+        with patch.object(manager, "start_server_folder", return_value=True):
+            with patch.object(manager, "wait_for_stack_ready", return_value=False):
+                with patch.object(manager, "start_server_apps") as start_apps:
+                    assert manager.start_boot_stack(server_folder, ["demo"]) is False
+    start_apps.assert_not_called()
+
+
+def test_start_boot_stack_starts_apps_after_server_is_ready(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "ci-server"
+    app_folder = server_folder / "demo"
+    app_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    (app_folder / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "wait_for_docker", return_value=True) as wait_docker:
+        with patch.object(manager, "start_server_folder", return_value=True) as start_server:
+            with patch.object(manager, "wait_for_stack_ready", return_value=True) as wait_ready:
+                with patch.object(manager, "start_server_apps", return_value=True) as start_apps:
+                    assert manager.start_boot_stack(server_folder, ["demo"]) is True
+    compose_files = wait_docker.call_args.kwargs["compose_files"]
+    assert server_folder / "docker-compose.yml" in compose_files
+    assert app_folder / "docker-compose.yml" in compose_files
+    start_server.assert_called_once()
+    assert start_server.call_args.kwargs["retries"] == manager.BOOT_START_RETRIES
+    wait_ready.assert_called_once()
+    start_apps.assert_called_once()
+    assert start_apps.call_args.args[1] == ["demo"]
+    assert start_apps.call_args.kwargs["wait_ready"] is True
+    assert start_apps.call_args.kwargs["retries"] == manager.BOOT_START_RETRIES
+
+
+def test_start_server_retries_failed_compose_up(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    error = subprocess.CalledProcessError(1, ["docker", "compose", "up", "-d"])
+    with patch.object(
+        manager, "run_docker_compose", side_effect=[error, None]
+    ) as compose_up:
+        with patch("novavision.docker_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                ["docker", "ps"], 0, stdout="", stderr=""
+            )
+            with patch("novavision.docker_manager.time.sleep"):
+                assert manager._start_server(
+                    compose_file, retries=2, retry_delay=0
+                ) is True
+    assert compose_up.call_count == 2
+
+
+def test_start_server_apps_waits_for_each_app(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "ci-server"
+    app_folder = server_folder / "demo"
+    app_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    (app_folder / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_start_server", return_value=True) as start:
+        with patch.object(manager, "wait_for_stack_ready", return_value=True) as wait:
+            assert manager.start_server_apps(
+                server_folder, ["demo"], wait_ready=True, retries=3
+            ) is True
+    start.assert_called_once()
+    assert start.call_args.kwargs["retries"] == 3
+    wait.assert_called_once()
+    assert wait.call_args.kwargs["label"] == "app demo"
+
+
+def test_compose_service_containers_expands_env_names(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  pytorch:\n"
+        "    container_name: ${AGENT}-${APP_ID}-diginova-pytorch-service\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("AGENT=C9844B\nAPP_ID=A3DAD8\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    assert manager._compose_service_containers(compose_file) == [
+        ("pytorch", "C9844B-A3DAD8-diginova-pytorch-service")
+    ]
+
+
+def test_start_existing_named_containers_starts_stopped_and_skips_compose(
+    fake_logger, tmp_path
+):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  pytorch:\n"
+        "    container_name: C9844B-A3DAD8-diginova-pytorch-service\n"
+        "  media:\n"
+        "    container_name: C9844B-A3DAD8-diginova-media-service\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    states = {
+        "C9844B-A3DAD8-diginova-pytorch-service": False,
+        "C9844B-A3DAD8-diginova-media-service": True,
+    }
+    with patch.object(
+        manager, "_container_running_state", side_effect=lambda name: states[name]
+    ):
+        with patch("novavision.docker_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                ["docker", "ps"], 0, stdout="", stderr=""
+            )
+            with patch.object(manager, "run_docker_compose") as compose_up:
+                assert manager._start_server(compose_file) is True
+    started = [
+        call.args[0]
+        for call in run.call_args_list
+        if call.args and call.args[0][:2] == ["docker", "start"]
+    ]
+    assert ["docker", "start", "C9844B-A3DAD8-diginova-pytorch-service"] in started
+    compose_up.assert_not_called()
+
+
+def test_start_server_compose_up_only_missing_services(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  pytorch:\n"
+        "    container_name: existing-pytorch\n"
+        "  media:\n"
+        "    container_name: missing-media\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+
+    def fake_state(name):
+        if name == "existing-pytorch":
+            return False
+        return None
+
+    with patch.object(manager, "_container_running_state", side_effect=fake_state):
+        with patch("novavision.docker_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                ["docker", "ps"], 0, stdout="", stderr=""
+            )
+            with patch.object(manager, "run_docker_compose") as compose_up:
+                assert manager._start_server(compose_file) is True
+    compose_up.assert_called_once()
+    assert compose_up.call_args.args[1:] == ("up", "-d", "media")
+
+
+def test_stale_container_is_removed_and_recreated(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  pytorch:\n"
+        "    container_name: stale-pytorch\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "start"]:
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr="failed to set up container networking: network not found",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch.object(manager, "_container_running_state", return_value=False):
+        with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run) as run:
+            with patch.object(manager, "run_docker_compose") as compose_up:
+                assert manager._start_server(compose_file) is True
+    removed = [
+        call.args[0]
+        for call in run.call_args_list
+        if call.args and call.args[0][:3] == ["docker", "rm", "-f"]
+    ]
+    assert ["docker", "rm", "-f", "stale-pytorch"] in removed
+    compose_up.assert_called_once()
+    assert compose_up.call_args.args[1:] == ("up", "-d")
+    assert any(
+        "recreating it" in message for message in fake_logger.messages_of("warning")
+    )
