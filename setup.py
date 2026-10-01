@@ -16,6 +16,7 @@ setup(
         "docker>=6.1.3,<7",
         "rich==13.9.4",
         "pyyaml==6.0.2",
+        "redis==5.2.1",
     ],
     extras_require={
         ":sys_platform=='darwin'": ["pyobjc"],

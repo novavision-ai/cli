@@ -142,7 +142,12 @@ class ServiceManager:
                 .get("apps")
                 or []
             )
-            return self.docker.start_boot_stack(server_folder, apps)
+            started = self.docker.start_boot_stack(server_folder, apps)
+            if started:
+                from novavision.update_listener import start_update_listener
+
+                start_update_listener(self.log)
+            return started
         if action == "stop-server":
             return self.docker.stop_server_folder(server_folder)
 

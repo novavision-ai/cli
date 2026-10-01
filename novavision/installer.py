@@ -1,22 +1,80 @@
+import hashlib
 import json
 import os
 import shutil
+import tempfile
+import time
 import zipfile
 import requests
 import subprocess
 
 from datetime import datetime
 from pathlib import Path
+from novavision.host_metrics import start_host_metrics
 from novavision.logger import ConsoleLogger
 from novavision.utils import get_system_info
 from novavision.docker_manager import DockerManager
 from novavision.service_manager import ServiceManager
 
 
+def _pid_alive(pid):
+    try:
+        import psutil
+
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return False
+
+
+def _read_env_file(path):
+    values = {}
+    path = Path(path)
+    if not path.is_file():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value
+    return values
+
+
+def _merge_env_text(existing, incoming):
+    """Add keys from incoming that are missing in existing. Keep existing values."""
+    seen = set()
+    for raw in (existing or "").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            seen.add(line.split("=", 1)[0].strip())
+
+    additions = []
+    for raw in (incoming or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        additions.append(line)
+    if not additions:
+        return existing or ""
+
+    text = existing or ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n".join(additions) + "\n"
+    return text
+
+
 class Installer:
     DEVICE_TYPE_CLOUD = 1
     DEVICE_TYPE_EDGE = 2
     DEVICE_TYPE_LOCAL = 3
+    REBUILD_TIMEOUT_SECONDS = 120
+    STATUS_TIMEOUT_SECONDS = 60
+    STATUS_INTERVAL_SECONDS = 2
 
     def __init__(self, logger: ConsoleLogger):
         self.log = logger if logger else ConsoleLogger()
@@ -116,19 +174,24 @@ class Installer:
             host = host + "/"
         return host
 
-    def request_to_endpoint(self, method, endpoint, data=None, auth_token=None):
+    def request_to_endpoint(
+        self, method, endpoint, data=None, auth_token=None, timeout=None
+    ):
         # Genel API istek fonksiyonu
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        request_kwargs = {"headers": headers}
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
         response = None
         try:
             if method == "get":
-                response = requests.get(endpoint, headers=headers)
+                response = requests.get(endpoint, **request_kwargs)
             elif method == "post":
-                response = requests.post(endpoint, data=data, headers=headers)
+                response = requests.post(endpoint, data=data, **request_kwargs)
             elif method == "put":
-                response = requests.put(endpoint, data=data, headers=headers)
+                response = requests.put(endpoint, data=data, **request_kwargs)
             elif method == "delete":
-                response = requests.delete(endpoint, headers=headers)
+                response = requests.delete(endpoint, **request_kwargs)
             else:
                 self.log.error(f"Invalid HTTP method: {method}")
                 return None
@@ -234,6 +297,11 @@ class Installer:
         self._save_server_metadata(
             server_folder, register_response, host, workspace_name
         )
+        if getattr(self, "_installed_package_sha256", None):
+            self._store_package_hash(server_folder.name, self._installed_package_sha256)
+        from novavision.update_listener import start_update_listener
+
+        start_update_listener(self.log)
         return True
 
     def _get_workspace_id(self, host, token, workspace):
@@ -541,7 +609,9 @@ class Installer:
                                     "Please select a device to remove",
                                     len(device_response),
                                 )
-                                device_id_to_delete = device_response[choice]["id_device"]
+                                device_id_to_delete = device_response[choice][
+                                    "id_device"
+                                ]
                                 self._delete_device(device_id_to_delete, host, token)
 
                             else:
@@ -648,7 +718,609 @@ class Installer:
             except Exception as e:
                 self.log.warning(f"Could not update server metadata: {e}")
 
+        if not metadata:
+            from novavision.update_listener import stop_update_listener
+
+            stop_update_listener(self.log)
         return True
+
+    def update(self, token, server_name=None, assume_yes=False):
+        if not self._acquire_update_lock():
+            self.log.error("An update is already running.")
+            return False
+        try:
+            return self._run_server_update(
+                token, server_name=server_name, assume_yes=assume_yes
+            )["ok"]
+        finally:
+            self._release_update_lock()
+
+    def _run_server_update(
+        self, token, server_name=None, assume_yes=False, package_id=None
+    ):
+        """Download a server package and rebuild that server in place.
+
+        A manual update asks Suite to build a new package. A listener update
+        already has the package id Suite published.
+        """
+        if not self.docker._check_docker_available():
+            return self._finish_update(
+                False,
+                self._error_report("Docker is not available."),
+            )
+
+        server_folder, folder_name, server_meta = self._resolve_server_target(
+            server_name
+        )
+        if not server_folder:
+            return self._finish_update(
+                False, self._error_report("Server was not found.")
+            )
+        if not server_folder.is_dir():
+            self.log.error(f"Server folder not found: {folder_name}")
+            return self._finish_update(
+                False, self._error_report(f"Server folder not found: {folder_name}")
+            )
+
+        compose_file = server_folder / "docker-compose.yml"
+        if not compose_file.exists():
+            self.log.error(f"No docker-compose.yml found in {server_folder}!")
+            return self._finish_update(
+                False,
+                self._error_report(f"No docker-compose.yml found in {server_folder}."),
+            )
+
+        id_device = (server_meta or {}).get("id_device")
+        host = (server_meta or {}).get("host")
+        if not id_device or not host:
+            message = (
+                "Server metadata is missing host or device id. "
+                "Reinstall the server to refresh it."
+            )
+            self.log.error(message)
+            return self._finish_update(False, self._error_report(message))
+
+        if not self._confirm_update(folder_name, server_meta, assume_yes):
+            return {"ok": False, "report": None}
+
+        self.log.step(1, 3, "Downloading server package")
+        if package_id is None:
+            package = self._download_server_package(host, token, id_device)
+        else:
+            package = self._download_package_file(host, token, package_id)
+            self._downloaded_package_id = package_id
+        if not package:
+            return self._finish_update(
+                False,
+                self._error_report("Failed to download the server package."),
+            )
+
+        resolved_package_id = getattr(self, "_downloaded_package_id", None) or package_id
+        package_sha256 = self._package_sha256(package)
+        saved_sha256 = (server_meta or {}).get("package_sha256")
+        running_now = self.docker._server_is_running(server_folder)
+        if saved_sha256 and saved_sha256 == package_sha256:
+            self.log.warning(
+                "Suite returned the same server package as the one already installed. "
+                "Server contents will not change with this update."
+            )
+            return self._finish_update(
+                True,
+                {
+                    "status_code": 200,
+                    "status": "success",
+                    "changed": False,
+                    "server_package": resolved_package_id,
+                    "hash": package_sha256,
+                    "running": running_now,
+                    "message": "Server package unchanged",
+                },
+            )
+        if not saved_sha256:
+            self.log.info(
+                "No package hash is stored for this server. "
+                "Updating it and saving a hash for the next update."
+            )
+
+        if running_now:
+            self.log.info(f"Stopping server {folder_name} before update.")
+            try:
+                self.docker.run_docker_compose(compose_file, "stop")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                message = f"Could not stop server before update: {e}"
+                self.log.error(message)
+                return self._finish_update(False, self._error_report(message))
+
+        self.log.step(2, 3, "Applying package")
+        if not self._apply_package_to_server(package, server_folder):
+            self._restart_server_after_update(compose_file, running_now)
+            return self._finish_update(
+                False, self._error_report("Failed to apply the server package.")
+            )
+
+        self.log.step(3, 3, "Rebuilding server")
+        try:
+            with self.log.loading("Building server"):
+                self.docker.run_docker_compose(compose_file, "build", "--no-cache")
+        except subprocess.CalledProcessError as e:
+            message = self._compose_error_message(e)
+            self.log.error(message)
+            self._restart_server_after_update(compose_file, running_now)
+            return self._finish_update(False, self._error_report(message))
+        except FileNotFoundError as e:
+            self.log.error(str(e))
+            self._restart_server_after_update(compose_file, running_now)
+            return self._finish_update(False, self._error_report(str(e)))
+
+        if running_now:
+            if not self._restart_server_after_update(compose_file, True):
+                return self._finish_update(
+                    False,
+                    self._error_report("Server was updated but could not be restarted."),
+                )
+            if not self._wait_for_server_status(server_folder):
+                detail = getattr(self, "_last_status_error", "") or "no response"
+                message = f"Server updated but /status did not return 200. {detail}"
+                self.log.error(message)
+                self._store_package_hash(folder_name, package_sha256)
+                from novavision.update_listener import start_update_listener
+
+                start_update_listener(self.log)
+                return self._finish_update(
+                    False,
+                    self._error_report(
+                        message,
+                        server_package=resolved_package_id,
+                        package_hash=package_sha256,
+                    ),
+                )
+            self.log.success(f"Server {folder_name} updated and restarted.")
+            running = True
+        else:
+            self.log.success(
+                f"Server {folder_name} updated. Start it to use the new build."
+            )
+            running = False
+        self._store_package_hash(folder_name, package_sha256)
+        return self._finish_update(
+            True,
+            {
+                "status_code": 200,
+                "status": "success",
+                "changed": True,
+                "server_package": resolved_package_id,
+                "hash": package_sha256,
+                "running": running,
+                "message": "Server updated",
+            },
+        )
+
+    def _package_sha256(self, content):
+        return hashlib.sha256(content).hexdigest()
+
+    def _store_package_hash(self, folder_name, package_sha256):
+        if not folder_name or not package_sha256:
+            return
+
+        metadata = self._load_server_metadata()
+        server_metadata = metadata.get(folder_name)
+        if not isinstance(server_metadata, dict):
+            server_metadata = {}
+        server_metadata["package_sha256"] = package_sha256
+        metadata[folder_name] = server_metadata
+        try:
+            with open(self._metadata_path(), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            self.log.warning(f"Could not save package hash: {e}")
+
+    def _finish_update(self, ok, report):
+        if ok:
+            from novavision.update_listener import start_update_listener
+
+            start_update_listener(self.log)
+        return {"ok": ok, "report": report}
+
+    def _error_report(self, message, server_package=None, package_hash=None):
+        report = {"status_code": 500, "status": "error", "message": message}
+        if server_package is not None:
+            report["server_package"] = server_package
+        if package_hash:
+            report["hash"] = package_hash
+        return report
+
+    def _compose_error_message(self, error):
+        message = f"Docker Compose failed with error code {error.returncode}"
+        detail = getattr(error, "stderr", None) or getattr(error, "output", None) or ""
+        tail = "\n".join(str(detail).splitlines()[-20:])
+        if tail:
+            return f"{message}\n{tail}"
+        return message
+
+    def _update_lock_path(self):
+        return self.agent_dir / "update.lock"
+
+    def _acquire_update_lock(self):
+        path = self._update_lock_path()
+        if path.exists():
+            owner = self._update_lock_owner(path)
+            if owner == os.getpid():
+                return True
+            if owner and _pid_alive(owner):
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        self._update_lock_fd = fd
+        return True
+
+    def _release_update_lock(self):
+        fd = getattr(self, "_update_lock_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._update_lock_fd = None
+        path = self._update_lock_path()
+        try:
+            if self._update_lock_owner(path) == os.getpid():
+                path.unlink()
+        except OSError:
+            pass
+
+    def _update_lock_owner(self, path):
+        try:
+            return int(path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            return None
+
+    def _confirm_update(self, folder_name, server_meta, assume_yes):
+        if self.non_interactive or assume_yes:
+            return True
+
+        workspace = (server_meta or {}).get("workspace", "Unknown")
+        host = (server_meta or {}).get("host", "Unknown")
+        summary = (
+            f"Update server {folder_name} (workspace: {workspace}, host: {host}). "
+            "This asks Suite to build a new server package and rebuilds the server. "
+            "Local apps stay. Existing .env values stay, and new keys are added."
+        )
+        if self.log.confirm(summary, default=False):
+            return True
+        self.log.error("Update cancelled.")
+        return False
+
+    def _resolve_server_target(self, server_name):
+        metadata = self._load_server_metadata()
+        if not server_name:
+            if self.non_interactive:
+                self.log.error("Server id is required in non-interactive mode.")
+                return None, None, None
+            server_folder = self.docker.get_server_folder()
+            if not server_folder:
+                return None, None, None
+            server_name = server_folder.name
+
+        folder_name = server_name
+        server_meta = metadata.get(server_name, {})
+        if not server_meta:
+            for name, data in metadata.items():
+                if str(data.get("id_device")) == str(server_name):
+                    folder_name = name
+                    server_meta = data
+                    break
+        server_folder = Path.home() / ".novavision" / "Server" / folder_name
+        return server_folder, folder_name, server_meta
+
+    def _device_type_value(self, device):
+        value = (device or {}).get("device_type")
+        if value in (
+            self.DEVICE_TYPE_CLOUD,
+            self.DEVICE_TYPE_EDGE,
+            self.DEVICE_TYPE_LOCAL,
+        ):
+            return value
+        names = {
+            "cloud": self.DEVICE_TYPE_CLOUD,
+            "edge": self.DEVICE_TYPE_EDGE,
+            "local": self.DEVICE_TYPE_LOCAL,
+        }
+        return names.get(str(value).lower(), self.DEVICE_TYPE_LOCAL)
+
+    def _device_refresh_payload(self, device, device_info):
+        """Hardware fields install posts when a device is created.
+
+        The device write does not build a server package. Update sends the
+        current machine details, then asks Suite to rebuild the package.
+        """
+        port = (device or {}).get("os_api_port") or "7001"
+        payload = {
+            "name": (device or {}).get("name") or device_info["device_name"],
+            "serial": device_info["serial"],
+            "processor": device_info["processor"],
+            "cpu": device_info["cpu"],
+            "gpu": device_info["gpu"],
+            "os": device_info["os"],
+            "disk": device_info["disk"],
+            "memory": device_info["memory"],
+            "architecture": device_info["architecture"],
+            "platform": device_info["platform"],
+            "os_api_port": str(port),
+            "device_type": self._device_type_value(device),
+        }
+        if payload["device_type"] == self.DEVICE_TYPE_CLOUD and (device or {}).get(
+            "wan_host"
+        ):
+            payload["wan_host"] = device["wan_host"]
+        return payload
+
+    def _update_device_hardware(self, host, token, id_device, device):
+        device_info = get_system_info()
+        if "error" in device_info:
+            self.log.error(f"Error getting system info: {device_info['error']}")
+            return None
+        self._select_gpu(device_info)
+        payload = self._device_refresh_payload(device, device_info)
+        endpoint = f"{host}api/device/default/{id_device}?expand=user"
+        with self.log.loading("Updating device details"):
+            response = self.request_to_endpoint(
+                "put", endpoint=endpoint, data=payload, auth_token=token
+            )
+        if not response or getattr(response, "status_code", None) not in (200, 201):
+            self.log.error(
+                "Failed to update device details. "
+                f"{self._response_error_text(response, fallback='No response')}"
+            )
+            return None
+        try:
+            refreshed = response.json()
+        except Exception as e:
+            self.log.error(f"Failed to parse device response: {e}")
+            return None
+        if not isinstance(refreshed, dict):
+            self.log.error("Device response was not an object.")
+            return None
+        return refreshed
+
+    def _rebuild_server_package(self, host, token, id_device):
+        endpoint = (
+            f"{host}api/device/default/rebuild-server?id={id_device}&expand=user"
+        )
+        with self.log.loading("Building server package"):
+            response = self.request_to_endpoint(
+                "post",
+                endpoint=endpoint,
+                auth_token=token,
+                timeout=self.REBUILD_TIMEOUT_SECONDS,
+            )
+        if isinstance(response, requests.exceptions.Timeout):
+            self.log.error(
+                "Server package build timed out before the new package was saved."
+            )
+            return None
+        status = getattr(response, "status_code", None)
+        if status == 200:
+            try:
+                rebuilt = response.json()
+            except Exception as e:
+                self.log.error(f"Failed to parse rebuilt device: {e}")
+                return None
+            if not isinstance(rebuilt, dict):
+                self.log.error("Rebuilt device response was not an object.")
+                return None
+            if not rebuilt.get("server_package"):
+                self.log.error("Rebuild finished without a server package id.")
+                return None
+            self.log.success("Server package rebuilt.")
+            return rebuilt
+
+        code = self._response_code(response)
+        detail = self._response_error_text(response, fallback="No response")
+        if status == 504 or code == "timeout":
+            self.log.error(
+                "Server package build timed out before the new package was saved. "
+                f"{detail}"
+            )
+        elif status == 502 or code in ("build_failed", "no_agent"):
+            self.log.error(f"Server package build failed. {detail}")
+        else:
+            self.log.error(f"Failed to rebuild the server package. {detail}")
+        return None
+
+    def _response_code(self, response):
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        if isinstance(data, dict):
+            return data.get("code")
+        return None
+
+    def _download_server_package(self, host, token, id_device):
+        host = self.format_host(host)
+        device_endpoint = f"{host}api/device/default/{id_device}?expand=user"
+        device_response = self.request_to_endpoint(
+            "get", endpoint=device_endpoint, auth_token=token
+        )
+        if not device_response or getattr(device_response, "status_code", None) != 200:
+            self.log.error(
+                "Failed to get device. "
+                f"{self._response_error_text(device_response, fallback='No response')}"
+            )
+            return None
+
+        try:
+            server_data = device_response.json()
+        except Exception as e:
+            self.log.error(f"Failed to parse server response: {e}")
+            return None
+        if not isinstance(server_data, dict):
+            self.log.error("Device response was not an object.")
+            return None
+
+        refreshed = self._update_device_hardware(host, token, id_device, server_data)
+        if not refreshed:
+            return None
+        access_token = (refreshed.get("user") or {}).get("access_token") or (
+            (server_data.get("user") or {}).get("access_token")
+        ) or token
+        rebuilt = self._rebuild_server_package(host, access_token, id_device)
+        if not rebuilt:
+            return None
+        server_package = rebuilt.get("server_package")
+        access_token = (rebuilt.get("user") or {}).get("access_token") or access_token
+        self._downloaded_package_id = server_package
+        return self._download_package_file(host, access_token, server_package)
+
+    def _download_package_file(self, host, token, server_package):
+        host = self.format_host(host)
+        agent_endpoint = f"{host}api/storage/default/get-file?id={server_package}"
+        agent_response = self.request_to_endpoint(
+            "get", endpoint=agent_endpoint, auth_token=token
+        )
+        if not agent_response or getattr(agent_response, "status_code", None) != 200:
+            self.log.error(
+                "Failed to download server package. "
+                f"{self._response_error_text(agent_response, fallback='No response')}"
+            )
+            return None
+        content = getattr(agent_response, "content", None)
+        if not content:
+            self.log.error("Failed to download server package")
+            return None
+        return content
+
+    def _apply_package_to_server(self, content, server_folder):
+        try:
+            with tempfile.TemporaryDirectory(prefix="novavision-update-") as temp_dir:
+                zip_path = Path(temp_dir) / "server.zip"
+                zip_path.write_bytes(content)
+                extract_root = Path(temp_dir) / "extract"
+                extract_root.mkdir()
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(extract_root)
+
+                package_root = self._locate_package_server(
+                    extract_root, server_folder.name
+                )
+                if not package_root:
+                    self.log.error("No server folder found in the downloaded package.")
+                    return False
+
+                self._copy_package_tree(package_root, server_folder)
+                parent_env = package_root.parent / ".env"
+                if parent_env.is_file():
+                    self._merge_env_file(parent_env, server_folder.parent / ".env")
+        except zipfile.BadZipFile:
+            self.log.error("Error: The downloaded file is not a valid zip file")
+            return False
+        except Exception as e:
+            self.log.error(f"Error applying server package: {e}")
+            return False
+
+        self._ensure_root_path_env(server_folder.parent)
+        self.log.success("Server package applied.")
+        return True
+
+    def _locate_package_server(self, extract_root, preferred_name):
+        matches = [
+            compose.parent
+            for compose in extract_root.rglob("docker-compose.yml")
+            if compose.is_file()
+        ]
+        if not matches:
+            return None
+        named = [path for path in matches if path.name == preferred_name]
+        if named:
+            return min(named, key=lambda path: len(path.parts))
+        return min(matches, key=lambda path: len(path.parts))
+
+    def _copy_package_tree(self, source, destination):
+        for item in source.rglob("*"):
+            relative = item.relative_to(source)
+            target = destination / relative
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if item.name == ".env" and target.exists():
+                self._merge_env_file(item, target)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+    def _merge_env_file(self, source, destination):
+        incoming = Path(source).read_text(encoding="utf-8")
+        existing = ""
+        if destination.exists():
+            existing = destination.read_text(encoding="utf-8")
+        merged = _merge_env_text(existing, incoming)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if merged != existing:
+            destination.write_text(merged, encoding="utf-8")
+            self.log.info(f"Merged new settings into {destination.name}")
+        else:
+            self.log.info(f"Keeping existing {destination.name}")
+
+    def _wait_for_server_status(self, server_folder):
+        url = self._server_status_url(server_folder)
+        deadline = time.time() + self.STATUS_TIMEOUT_SECONDS
+        last_error = "no response"
+        while time.time() < deadline:
+            try:
+                response = requests.get(url, timeout=5)
+                if getattr(response, "status_code", None) == 200:
+                    self._last_status_error = ""
+                    return True
+                last_error = f"HTTP {response.status_code}"
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.STATUS_INTERVAL_SECONDS, remaining))
+        self._last_status_error = last_error
+        return False
+
+    def _server_status_url(self, server_folder):
+        env = _read_env_file(server_folder / ".env")
+        port = env.get("DIGINOVA_WSL_SERVICE_PORT") or "7001"
+        scheme = "https" if env.get("SERVER_SSL") == "1" else "http"
+        return f"{scheme}://127.0.0.1:{port}/status"
+
+    def _ensure_root_path_env(self, server_path):
+        env_file = Path(server_path) / ".env"
+        key, value = "ROOT_PATH", str(server_path)
+        if env_file.exists():
+            lines = env_file.read_text(encoding="utf-8").splitlines(keepends=True)
+            lines = [
+                f"{key}={value}\n" if line.startswith(f"{key}=") else line
+                for line in lines
+            ]
+            if not any(line.startswith(f"{key}=") for line in lines):
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] = lines[-1] + "\n"
+                lines.append(f"{key}={value}\n")
+        else:
+            lines = [f"{key}={value}\n"]
+        env_file.write_text("".join(lines), encoding="utf-8")
+
+    def _restart_server_after_update(self, compose_file, was_running):
+        if not was_running:
+            return True
+        try:
+            start_host_metrics(self.log)
+            self.docker.run_docker_compose(compose_file, "up", "-d", "--force-recreate")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            self.log.error(f"Server was updated but could not be restarted: {e}")
+            return False
 
     def _confirm_uninstall(self, folder_name, server_meta, assume_yes):
         if self.non_interactive or assume_yes:
@@ -775,14 +1447,19 @@ class Installer:
                 return
 
             # Download and extract server package
+            self._installed_package_sha256 = None
             agent_endpoint = f"{host}api/storage/default/get-file?id={server_package}"
             agent_response = self.request_to_endpoint(
                 "get", endpoint=agent_endpoint, auth_token=access_token
             )
 
-            if not agent_response:
+            if not agent_response or not getattr(agent_response, "content", None):
                 self.log.error("Failed to download server package")
                 return
+
+            self._installed_package_sha256 = self._package_sha256(
+                agent_response.content
+            )
 
             # Extract and setup server
             server_folder = self._extract_and_setup_server(agent_response.content)

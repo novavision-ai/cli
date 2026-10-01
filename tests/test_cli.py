@@ -43,6 +43,17 @@ def test_install_parses_token_host_and_workspace():
     assert args.non_interactive is True
 
 
+def test_update_parses_token_id_and_yes():
+    args = _parser().parse_args(
+        ["update", "server", "ci-token", "--id", "abcdef", "--yes"]
+    )
+    assert args.command == "update"
+    assert args.type == "server"
+    assert args.token == "ci-token"
+    assert args.id == "abcdef"
+    assert args.yes is True
+
+
 def test_uninstall_parses_token_and_id():
     args = _parser().parse_args(["uninstall", "server", "ci-token", "--id", "abcdef"])
     assert args.command == "uninstall"

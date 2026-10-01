@@ -14,6 +14,7 @@ from novavision.host_metrics import (
     serve_host_metrics,
 )
 from novavision.service_manager import ServiceManager
+from novavision.update_listener import serve_update_listener
 
 logger = ConsoleLogger()
 
@@ -23,6 +24,7 @@ EPILOG = """examples:
   novavision start server --id abcdef
   novavision logs server --id abcdef --follow
   novavision stop server --id abcdef --close-apps
+  novavision update server TOKEN --id abcdef --yes
   novavision uninstall server TOKEN --id abcdef --yes
 """
 
@@ -70,6 +72,7 @@ class NovaVisionCLI:
         subparsers.required = True
 
         self._add_install_parser(subparsers, parent)
+        self._add_update_parser(subparsers, parent)
         self._add_uninstall_parser(subparsers, parent)
         self._add_start_parser(subparsers, parent)
         self._add_stop_parser(subparsers, parent)
@@ -115,6 +118,29 @@ class NovaVisionCLI:
             "--non-interactive",
             action="store_true",
             help="Skip prompts. Requires --workspace. Defaults to port 7001 if --port is omitted.",
+        )
+
+    def _add_update_parser(self, subparsers, parent):
+        update_parser = subparsers.add_parser(
+            "update",
+            help="Download the latest server package and rebuild an existing server",
+            parents=[parent],
+        )
+        update_parser.add_argument(
+            "type",
+            choices=["server"],
+            help="Resource to update",
+        )
+        update_parser.add_argument(
+            "token", help="User authentication token used to download the server package"
+        )
+        update_parser.add_argument(
+            "--id", help="Server folder ID or device ID", required=False
+        )
+        update_parser.add_argument(
+            "--yes",
+            action="store_true",
+            help="Do not ask for update confirmation",
         )
 
     def _add_uninstall_parser(self, subparsers, parent):
@@ -249,6 +275,11 @@ class NovaVisionCLI:
         )
         return metrics_parser
 
+    def _create_internal_listen_parser(self):
+        return argparse.ArgumentParser(
+            prog="novavision _listen", description=argparse.SUPPRESS
+        )
+
     def _apply_logger_settings(self, args):
         logger.configure(
             quiet=getattr(args, "quiet", False),
@@ -277,6 +308,23 @@ class NovaVisionCLI:
             workspace=workspace,
             port=args.port,
             non_interactive=args.non_interactive,
+        )
+        if not success:
+            raise SystemExit(1)
+
+    def handle_update(self, args):
+        log_dir = Path.home() / ".novavision"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = (
+            log_dir / f"update-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        )
+        update_logger = logger.copy_settings(log_file_path=str(log_file))
+        update_logger.info(f"Logging update to {log_file}")
+        self.installer = Installer(logger=update_logger)
+        success = self.installer.update(
+            token=args.token,
+            server_name=args.id,
+            assume_yes=getattr(args, "yes", False),
         )
         if not success:
             raise SystemExit(1)
@@ -373,6 +421,9 @@ class NovaVisionCLI:
         if not success:
             raise SystemExit(1)
 
+    def handle_internal_listen_command(self, args):
+        raise SystemExit(serve_update_listener(logger))
+
     def handle_internal_metrics_command(self, args):
         raise SystemExit(
             serve_host_metrics(
@@ -395,6 +446,12 @@ class NovaVisionCLI:
             self.handle_internal_metrics_command(args)
             return
 
+        if len(sys.argv) > 1 and sys.argv[1] == "_listen":
+            parser = self._create_internal_listen_parser()
+            args = parser.parse_args(sys.argv[2:])
+            self.handle_internal_listen_command(args)
+            return
+
         parser = self.create_parser()
         args = parser.parse_args()
         self._apply_logger_settings(args)
@@ -402,6 +459,8 @@ class NovaVisionCLI:
         try:
             if args.command == "install":
                 self.handle_install(args)
+            elif args.command == "update":
+                self.handle_update(args)
             elif args.command == "uninstall":
                 self.handle_uninstall(args)
             elif args.command in ["start", "stop"]:
