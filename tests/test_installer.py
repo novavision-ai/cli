@@ -1,3 +1,7 @@
+import hashlib
+import io
+import json
+import zipfile
 from unittest.mock import Mock, patch
 
 from novavision.installer import Installer
@@ -239,3 +243,266 @@ def test_uninstall_stops_without_privileges_when_user_confirms_disable(fake_logg
     disable_server.assert_not_called()
     delete_device.assert_not_called()
     assert server_folder.exists()
+
+
+def _server_package_zip():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "Server/abcdef/docker-compose.yml",
+            "services:\n  wsl:\n    image: new\n",
+        )
+        archive.writestr("Server/abcdef/modules/runner.py", "updated\n")
+        archive.writestr("Server/abcdef/wsl/runtime.txt", "fresh\n")
+        archive.writestr("Server/abcdef/.env", "KEEP=0\nAPI_WAIT_PER_NODE=20\n")
+        archive.writestr(
+            "Server/.env",
+            "METRIC_CHANNEL=/ws/new\nROOT_PATH=/opt/package\n",
+        )
+    return buffer.getvalue()
+
+
+def _installed_server(nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text(
+        "services:\n  wsl:\n    image: old\n", encoding="utf-8"
+    )
+    (server_folder / ".env").write_text("KEEP=1\n", encoding="utf-8")
+    app_file = server_folder / "apps" / "demo" / "local.txt"
+    app_file.parent.mkdir(parents=True)
+    app_file.write_text("keep\n", encoding="utf-8")
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://suite.novavision.ai", '
+        '"workspace": "ci"}}',
+        encoding="utf-8",
+    )
+    return server_folder
+
+
+def _device_payload():
+    return {
+        "device_name": "ci-runner",
+        "serial": "ABC",
+        "processor": "cpu",
+        "cpu": "CI CPU",
+        "gpu": "GPU",
+        "os": "Windows",
+        "disk": "1G/1G",
+        "memory": "2.00 GB",
+        "architecture": "x86_64",
+        "platform": "PC",
+    }
+
+
+def test_download_rebuilds_package_before_fetching_it(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    device = {
+        "id_device": 42,
+        "name": "desk",
+        "device_type": 3,
+        "os_api_port": "7001",
+        "server_package": "old-package",
+        "user": {"access_token": "device-token"},
+    }
+    rebuilt = dict(device)
+    rebuilt["server_package"] = "new-package"
+    get_response = Mock(status_code=200)
+    get_response.json.return_value = device
+    put_response = Mock(status_code=200)
+    put_response.json.return_value = device
+    rebuild_response = Mock(status_code=200)
+    rebuild_response.json.return_value = rebuilt
+    file_response = Mock(status_code=200, content=b"fresh-zip")
+    calls = []
+
+    def request(method, endpoint, data=None, auth_token=None, timeout=None):
+        calls.append((method, endpoint, data, auth_token, timeout))
+        if "rebuild-server" in endpoint:
+            return rebuild_response
+        if method == "put":
+            return put_response
+        if "get-file" in endpoint:
+            return file_response
+        return get_response
+
+    with patch("novavision.installer.get_system_info", return_value=_device_payload()):
+        with patch.object(installer, "request_to_endpoint", side_effect=request):
+            content = installer._download_server_package(
+                "https://suite.novavision.ai", "user-token", 42
+            )
+
+    assert content == b"fresh-zip"
+    assert [call[0] for call in calls] == ["get", "put", "post", "get"]
+    put_call = calls[1]
+    assert put_call[2]["name"] == "desk"
+    assert put_call[2]["device_type"] == Installer.DEVICE_TYPE_LOCAL
+    assert put_call[2]["os_api_port"] == "7001"
+    assert put_call[2]["serial"] == "ABC"
+    rebuild_call = calls[2]
+    assert "rebuild-server?id=42" in rebuild_call[1]
+    assert rebuild_call[3] == "device-token"
+    assert rebuild_call[4] == Installer.REBUILD_TIMEOUT_SECONDS
+    assert "id=new-package" in calls[-1][1]
+    assert calls[-1][3] == "device-token"
+    assert "id=old-package" not in calls[-1][1]
+
+
+def test_download_stops_when_rebuild_fails(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    device = {
+        "id_device": 42,
+        "name": "desk",
+        "device_type": 3,
+        "server_package": "old-package",
+        "user": {"access_token": "device-token"},
+    }
+    failed = Mock(status_code=502)
+    failed.json.return_value = {"error": "agent missing", "code": "no_agent"}
+    calls = []
+
+    def request(method, endpoint, data=None, auth_token=None, timeout=None):
+        calls.append(endpoint)
+        if "rebuild-server" in endpoint:
+            return failed
+        response = Mock(status_code=200)
+        response.json.return_value = device
+        return response
+
+    with patch("novavision.installer.get_system_info", return_value=_device_payload()):
+        with patch.object(installer, "request_to_endpoint", side_effect=request):
+            assert (
+                installer._download_server_package(
+                    "https://suite.novavision.ai", "user-token", 42
+                )
+                is None
+            )
+
+    assert not any("get-file" in endpoint for endpoint in calls)
+    errors = " ".join(fake_logger.messages_of("error")).lower()
+    assert "no_agent" in errors or "build failed" in errors
+
+
+def test_update_confirm_cancels(fake_logger, nv_home):
+    server_folder = _installed_server(nv_home)
+    fake_logger.answers = ["n"]
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(installer, "_download_server_package") as download:
+            assert installer.update(token="ci-token", server_name="abcdef") is False
+    download.assert_not_called()
+    assert "image: old" in (server_folder / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_update_applies_package_keeps_apps_and_rebuilds(fake_logger, nv_home):
+    server_folder = _installed_server(nv_home)
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(
+            installer, "_download_server_package", return_value=_server_package_zip()
+        ):
+            with patch.object(installer.docker, "_server_is_running", return_value=False):
+                with patch.object(installer.docker, "run_docker_compose") as compose:
+                    assert (
+                        installer.update(
+                            token="ci-token", server_name="abcdef", assume_yes=True
+                        )
+                        is True
+                    )
+    compose.assert_called_once_with(
+        server_folder / "docker-compose.yml", "build", "--no-cache"
+    )
+    assert "image: new" in (server_folder / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert (server_folder / "modules" / "runner.py").read_text(encoding="utf-8") == (
+        "updated\n"
+    )
+    assert (server_folder / "wsl" / "runtime.txt").read_text(encoding="utf-8") == (
+        "fresh\n"
+    )
+    env_text = (server_folder / ".env").read_text(encoding="utf-8")
+    assert "KEEP=1" in env_text
+    assert "KEEP=0" not in env_text
+    assert "API_WAIT_PER_NODE=20" in env_text
+    assert (server_folder / "apps" / "demo" / "local.txt").read_text(
+        encoding="utf-8"
+    ) == "keep\n"
+    parent_env = (server_folder.parent / ".env").read_text(encoding="utf-8")
+    assert "METRIC_CHANNEL=/ws/new" in parent_env
+    assert f"ROOT_PATH={server_folder.parent}" in parent_env
+    assert "/opt/package" not in parent_env
+    saved = installer._load_server_metadata()["abcdef"]
+    assert saved["package_sha256"] == installer._package_sha256(_server_package_zip())
+    assert saved["id_device"] == 42
+
+
+def test_update_restarts_a_running_server(fake_logger, nv_home):
+    server_folder = _installed_server(nv_home)
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(
+            installer, "_download_server_package", return_value=_server_package_zip()
+        ):
+            with patch.object(installer.docker, "_server_is_running", return_value=True):
+                with patch.object(installer.docker, "run_docker_compose") as compose:
+                    with patch("novavision.installer.start_host_metrics"):
+                        with patch.object(
+                            installer, "_wait_for_server_status", return_value=True
+                        ):
+                            assert (
+                                installer.update(
+                                    token="ci-token",
+                                    server_name="42",
+                                    assume_yes=True,
+                                )
+                                is True
+                            )
+    assert [call.args[1:] for call in compose.call_args_list] == [
+        ("stop",),
+        ("build", "--no-cache"),
+        ("up", "-d", "--force-recreate"),
+    ]
+    assert "image: new" in (server_folder / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_update_skips_when_package_hash_matches(fake_logger, nv_home):
+    server_folder = _installed_server(nv_home)
+    package = _server_package_zip()
+    metadata = {
+        "abcdef": {
+            "id_device": 42,
+            "host": "https://suite.novavision.ai",
+            "workspace": "ci",
+            "service": {"enabled": True, "apps": ["demo"]},
+            "package_sha256": hashlib.sha256(package).hexdigest(),
+        }
+    }
+    (nv_home / ".novavision" / "servers.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(installer, "_download_server_package", return_value=package):
+            with patch.object(installer.docker, "_server_is_running", return_value=False):
+                with patch.object(installer.docker, "run_docker_compose") as compose:
+                    assert (
+                        installer.update(
+                            token="ci-token", server_name="abcdef", assume_yes=True
+                        )
+                        is True
+                    )
+    compose.assert_not_called()
+    assert "image: old" in (server_folder / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert any(
+        "same server package" in message for message in fake_logger.messages_of("warning")
+    )
+    kept = installer._load_server_metadata()["abcdef"]
+    assert kept["service"]["enabled"] is True
+    assert kept["package_sha256"] == metadata["abcdef"]["package_sha256"]

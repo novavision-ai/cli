@@ -446,7 +446,9 @@ class DockerManager:
         if command == "start":
             if type == "server":
                 if server_name:
-                    return self.start_server_folder(self.get_server_folder(server_name))
+                    return self._start_server_with_listener(
+                        self.get_server_folder(server_name)
+                    )
                 server_folder = (
                     self.choose_server_folder(server_path) if select_server else None
                 )
@@ -455,12 +457,16 @@ class DockerManager:
                         item for item in server_path.iterdir() if item.is_dir()
                     ]
                     started = True
+                    any_started = False
                     for folder in server_folders:
-                        if not self.start_server_folder(folder):
+                        if self.start_server_folder(folder):
+                            any_started = True
+                        else:
                             started = False
+                    self._after_server_start(any_started)
                     return started
                 server_folder = server_folder or self.choose_server_folder(server_path)
-                return self.start_server_folder(server_folder)
+                return self._start_server_with_listener(server_folder)
             elif type == "app":
                 return self._start_app(app_name)
 
@@ -475,6 +481,16 @@ class DockerManager:
             elif type == "app":
                 return self._stop_app(app_name)
         return False
+
+    def _start_server_with_listener(self, server_folder):
+        return self._after_server_start(self.start_server_folder(server_folder))
+
+    def _after_server_start(self, started):
+        if started:
+            from novavision.update_listener import start_update_listener
+
+            start_update_listener(self.log)
+        return started
 
     def _docker_compose_command(self):
         if shutil.which("docker"):

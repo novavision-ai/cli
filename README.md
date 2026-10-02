@@ -44,6 +44,20 @@ novavision install [edge|local|cloud] <USER_TOKEN> --host <HOST> --workspace <US
 
 ---
 
+### **update**
+Downloads the latest server package for an existing server and rebuilds it.
+
+```bash
+novavision update server <USER_TOKEN> --id <SERVER_ID>
+```
+
+**Parameters**
+- `USER_TOKEN`: User token required to download the server package.
+- `--id`: Server folder ID, or the device ID stored in server metadata. If omitted, you will be asked to select a server.
+- `--yes`: Skip the update confirmation prompt.
+
+---
+
 ### **uninstall**  
 Stops a local server, deletes the registered device from Suite, and removes the local server folder.
 
