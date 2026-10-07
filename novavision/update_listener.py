@@ -183,7 +183,7 @@ def post_update_status(target, request_uuid, report, post=None):
     sender = post or requests.post
     response = sender(
         f"{web_api}/ide/request/update-status-by-uuid",
-        params={"access-token": token},
+        headers={"Authorization": f"Bearer {token}"},
         data={"uuid": request_uuid, "data": json.dumps(report)},
         timeout=30,
     )
