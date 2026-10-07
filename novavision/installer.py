@@ -206,27 +206,28 @@ class Installer:
             return str(response)
 
         status = getattr(response, "status_code", None)
-        try:
-            data = response.json()
-            if isinstance(data, dict):
-                message = data.get("message") or data.get("error") or data.get("detail")
-                if isinstance(message, (dict, list)):
-                    message = str(message)
-                if message:
-                    suffix = f" (HTTP {status})" if status is not None else ""
-                    return f"{message}{suffix}"
-        except Exception:
-            pass
-
-        text = (getattr(response, "text", None) or "").strip()
-        if text:
-            if len(text) > 300:
-                text = text[:297] + "..."
-            suffix = f" (HTTP {status})" if status is not None else ""
-            return f"{text}{suffix}"
+        message = self._response_message(response)
+        if message and status is not None:
+            return f"{message} (HTTP {status})"
+        if message:
+            return message
         if status is not None:
             return f"{fallback} (HTTP {status})"
         return fallback
+
+    def _response_message(self, response):
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        message = data.get("message") or data.get("error") or data.get("detail")
+        if isinstance(message, (dict, list)):
+            message = str(message)
+        elif message is not None:
+            message = str(message).strip()
+        return message or None
 
     def install(
         self, device_type, token, host, workspace, port=None, non_interactive=False
@@ -335,7 +336,7 @@ class Installer:
             return None
 
         try:
-            workspace_list = workspace_list_response.json()
+            workspace_list = self._unique_workspaces(workspace_list_response.json())
         except Exception as e:
             self.log.error(f"Failed to parse workspace response: {e}")
             return None
@@ -398,23 +399,48 @@ class Installer:
                 return None
             return workspace_user_id, workspace
 
+    def _unique_workspaces(self, workspace_list):
+        if not isinstance(workspace_list, list):
+            return workspace_list
+
+        unique = []
+        seen = set()
+        for item in workspace_list:
+            if not isinstance(item, dict):
+                unique.append(item)
+                continue
+            workspace_id = item.get("id_workspace")
+            if workspace_id is None:
+                nested = item.get("workspace")
+                if isinstance(nested, dict):
+                    workspace_id = nested.get("id_workspace", nested.get("id"))
+            if workspace_id is None:
+                unique.append(item)
+                continue
+            key = str(workspace_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
+
     def _set_workspace(self, host, token, workspace_user_id):
         if workspace_user_id is None:
             self.log.error("Workspace user_id not found.")
             return False
 
-        set_workspace_endpoint = f"{host}api/workspace/user/{workspace_user_id}"
-        workspace_data = {"status": 1}
+        set_workspace_endpoint = f"{host}api/workspace/default/set-workspace"
+        workspace_data = {"id": workspace_user_id}
 
         set_workspace_response = self.request_to_endpoint(
-            method="put",
+            method="post",
             endpoint=set_workspace_endpoint,
             data=workspace_data,
             auth_token=token,
         )
 
         try:
-            if set_workspace_response.status_code == 200:
+            if set_workspace_response.status_code in (200, 201):
                 self.log.success("Workspace set successfully!")
                 return True
             else:

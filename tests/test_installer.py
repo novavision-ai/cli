@@ -83,6 +83,61 @@ def test_response_error_text_prefers_json_message(fake_logger, nv_home):
     assert "400" in installer._response_error_text(response)
 
 
+def test_response_error_text_reports_status_without_html(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    response = Mock()
+    response.status_code = 404
+    response.json.side_effect = ValueError("not json")
+    response.text = "<html><title>Not Found</title><body>nginx</body></html>"
+    assert installer._response_error_text(response) == "Request failed (HTTP 404)"
+
+    response.json.side_effect = None
+    response.json.return_value = {"message": "Workspace not found"}
+    assert (
+        installer._response_error_text(response)
+        == "Workspace not found (HTTP 404)"
+    )
+
+
+def test_unique_workspaces_keeps_one_row_per_id(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    rows = [
+        {"id_workspace_user": 1, "id_workspace": 10, "workspace": {"name": "ci"}},
+        {"id_workspace_user": 2, "id_workspace": "10", "workspace": {"name": "ci"}},
+        {"id_workspace_user": 3, "id_workspace": 11, "workspace": {"name": "other"}},
+    ]
+    unique = installer._unique_workspaces(rows)
+    assert [row["id_workspace_user"] for row in unique] == [1, 3]
+
+
+def test_set_workspace_posts_membership_id(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    response = Mock(status_code=200)
+    with patch.object(installer, "request_to_endpoint", return_value=response) as request:
+        assert installer._set_workspace("https://suite.novavision.ai/", "tok", 15)
+    request.assert_called_once_with(
+        method="post",
+        endpoint="https://suite.novavision.ai/api/workspace/default/set-workspace",
+        data={"id": 15},
+        auth_token="tok",
+    )
+
+
+def test_send_deploy_status_keeps_token_out_of_the_url(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    response = Mock(status_code=200)
+    endpoint = "https://suite.novavision.ai/api/deployment/default/9"
+    with patch.object(installer, "request_to_endpoint", return_value=response) as request:
+        installer.send_deploy_status({"is_deploy": 1}, "device-token", endpoint)
+    request.assert_called_once_with(
+        "put",
+        endpoint=endpoint,
+        data={"is_deploy": 1},
+        auth_token="device-token",
+    )
+    assert "access-token" not in endpoint
+
+
 def test_uninstall_confirm_cancels(fake_logger, nv_home):
     server_folder = nv_home / ".novavision" / "Server" / "abcdef"
     server_folder.mkdir(parents=True)
@@ -341,6 +396,7 @@ def test_download_rebuilds_package_before_fetching_it(fake_logger, nv_home):
     assert put_call[2]["serial"] == "ABC"
     rebuild_call = calls[2]
     assert "rebuild-server?id=42" in rebuild_call[1]
+    assert "expand=user" in rebuild_call[1]
     assert rebuild_call[3] == "device-token"
     assert rebuild_call[4] == Installer.REBUILD_TIMEOUT_SECONDS
     assert "id=new-package" in calls[-1][1]

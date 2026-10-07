@@ -137,9 +137,10 @@ def test_dispatch_reports_the_update_result(nv_home):
 def test_post_update_status_uses_form_body():
     posted = {}
 
-    def post(url, params=None, data=None, timeout=None):
+    def post(url, params=None, data=None, timeout=None, headers=None):
         posted["url"] = url
         posted["params"] = params
+        posted["headers"] = headers
         posted["data"] = data
         return Mock(status_code=200)
 
@@ -150,7 +151,9 @@ def test_post_update_status_uses_form_body():
         post=post,
     )
     assert posted["url"].endswith("/ide/request/update-status-by-uuid")
-    assert posted["params"]["access-token"] == "device-token"
+    assert "access-token" not in posted["url"]
+    assert posted["params"] is None
+    assert posted["headers"]["Authorization"] == "Bearer device-token"
     assert posted["data"]["uuid"] == "uuid-1"
     assert json.loads(posted["data"]["data"])["changed"] is False
 
