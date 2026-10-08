@@ -13,10 +13,38 @@ def test_version_flag():
     assert exc.value.code == 0
 
 
-def test_install_requires_token():
+def test_install_token_is_optional_after_login():
+    args = _parser().parse_args(["install", "local"])
+    assert args.token is None
+    assert args.token_flag is None
+
+
+def test_token_flag_overrides_positional_token():
+    args = _parser().parse_args(
+        ["install", "local", "positional-token", "--token", "flag-token"]
+    )
+    assert args.token == "positional-token"
+    assert args.token_flag == "flag-token"
+
+
+def test_login_logout_and_whoami_parse():
     parser = _parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["install", "local"])
+    login = parser.parse_args(["login", "--host", "alfa.suite.novavision.ai"])
+    assert login.command == "login"
+    assert login.host == "alfa.suite.novavision.ai"
+    assert parser.parse_args(["login"]).host is None
+    assert parser.parse_args(["logout"]).command == "logout"
+    assert parser.parse_args(["whoami"]).command == "whoami"
+
+
+def test_update_and_uninstall_token_is_optional():
+    parser = _parser()
+    update = parser.parse_args(["update", "server", "--id", "abcdef", "--yes"])
+    assert update.token is None
+    assert update.token_flag is None
+    uninstall = parser.parse_args(["uninstall", "server", "--id", "abcdef"])
+    assert uninstall.token is None
+    assert uninstall.id == "abcdef"
 
 
 def test_install_parses_token_host_and_workspace():

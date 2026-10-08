@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import yaml
 
+from novavision.credentials import save_credentials
 from novavision.docker_manager import DockerManager
 
 
@@ -51,6 +52,97 @@ def test_choose_server_folder_table_includes_selection_numbers(fake_logger, nv_h
     assert fake_logger.tables
     assert fake_logger.tables[0]["headers"][0] == "#"
     assert [row[0] for row in fake_logger.tables[0]["rows"]] == ["1", "2"]
+
+
+def _write_hosted_servers(nv_home, hosts):
+    metadata = {}
+    for name, host in hosts.items():
+        folder = nv_home / ".novavision" / "Server" / name
+        folder.mkdir(parents=True)
+        metadata[name] = {"host": host, "workspace": "ci"}
+    (nv_home / ".novavision" / "servers.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+
+def _table_ids(table):
+    headers = table["headers"]
+    id_index = headers.index("ID")
+    return [row[id_index] for row in table["rows"]]
+
+
+def test_list_servers_keeps_every_host_while_logged_in(fake_logger, nv_home):
+    save_credentials("https://suite.novavision.ai", "saved-token", "selcukoz")
+    _write_hosted_servers(
+        nv_home,
+        {
+            "suite-a": "https://suite.novavision.ai",
+            "alfa-a": "https://alfa.suite.novavision.ai",
+        },
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_server_is_running", return_value=False):
+        assert manager.list_servers() is True
+    assert _table_ids(fake_logger.tables[0]) == ["alfa-a", "suite-a"]
+    assert fake_logger.messages_of("note") == []
+
+
+def test_choose_server_folder_lists_only_the_login_host(fake_logger, nv_home):
+    save_credentials("https://suite.novavision.ai", "saved-token", "selcukoz")
+    _write_hosted_servers(
+        nv_home,
+        {
+            "suite-a": "https://suite.novavision.ai",
+            "suite-b": "https://suite.novavision.ai/",
+            "alfa-a": "https://alfa.suite.novavision.ai",
+        },
+    )
+    fake_logger.answers = ["2"]
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_server_is_running", return_value=False):
+        selected = manager.choose_server_folder(nv_home / ".novavision" / "Server")
+    assert selected.name == "suite-b"
+    assert _table_ids(fake_logger.tables[0]) == ["suite-a", "suite-b"]
+    assert fake_logger.messages_of("note") == [
+        "1 server on another host is not shown."
+    ]
+
+
+def test_status_lists_only_the_login_host(fake_logger, nv_home):
+    save_credentials("https://suite.novavision.ai", "saved-token", "selcukoz")
+    _write_hosted_servers(
+        nv_home,
+        {
+            "suite-a": "https://suite.novavision.ai",
+            "alfa-a": "https://alfa.suite.novavision.ai",
+            "alfa-b": "http://alfa.suite.novavision.ai",
+        },
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_server_is_running", return_value=False):
+        assert manager.show_status() is True
+    assert _table_ids(fake_logger.tables[0]) == ["suite-a"]
+    assert fake_logger.messages_of("note") == [
+        "2 servers on other hosts are not shown."
+    ]
+
+
+def test_choose_server_folder_reports_when_login_host_has_no_servers(
+    fake_logger, nv_home
+):
+    save_credentials("https://suite.novavision.ai", "saved-token", "selcukoz")
+    _write_hosted_servers(
+        nv_home, {"alfa-a": "https://alfa.suite.novavision.ai"}
+    )
+    manager = DockerManager(logger=fake_logger)
+    assert manager.choose_server_folder(nv_home / ".novavision" / "Server") is None
+    assert any(
+        "No servers found for https://suite.novavision.ai." in message
+        for message in fake_logger.messages_of("error")
+    )
+    assert fake_logger.messages_of("note") == [
+        "1 server on another host is not shown."
+    ]
 
 
 def test_get_server_folder_by_id(fake_logger, nv_home):

@@ -68,6 +68,9 @@ class FakeLogger:
     def info(self, message):
         self._record("info", message)
 
+    def note(self, message):
+        self._record("note", message)
+
     def success(self, message):
         self._record("success", message)
 

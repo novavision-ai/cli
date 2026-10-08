@@ -22,6 +22,14 @@ def test_format_host_keeps_https(fake_logger, nv_home):
     assert installer.format_host("https://suite.novavision.ai/") == "https://suite.novavision.ai/"
 
 
+def test_format_host_normalizes_case_and_default_port(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    assert (
+        installer.format_host("HTTPS://Suite.NovaVision.ai:443")
+        == "https://suite.novavision.ai/"
+    )
+
+
 def test_request_to_endpoint_sends_bearer_token(fake_logger, nv_home):
     installer = Installer(logger=fake_logger)
     response = Mock()
@@ -562,3 +570,57 @@ def test_update_skips_when_package_hash_matches(fake_logger, nv_home):
     kept = installer._load_server_metadata()["abcdef"]
     assert kept["service"]["enabled"] is True
     assert kept["package_sha256"] == metadata["abcdef"]["package_sha256"]
+
+
+def test_uninstall_rejects_server_on_a_different_host_than_the_saved_login(
+    fake_logger, nv_home
+):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (nv_home / ".novavision" / "servers.json").write_text(
+        '{"abcdef": {"id_device": 42, "host": "https://alfa.suite.novavision.ai"}}',
+        encoding="utf-8",
+    )
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer, "_delete_device") as delete_device:
+        assert (
+            installer.uninstall(
+                token="saved-token",
+                server_name="abcdef",
+                login_host="https://suite.novavision.ai",
+            )
+            is False
+        )
+    delete_device.assert_not_called()
+    assert server_folder.exists()
+    assert "abcdef" in installer._load_server_metadata()
+    assert any(
+        "alfa.suite.novavision.ai" in message
+        for message in fake_logger.messages_of("error")
+    )
+
+
+def test_update_rejects_server_on_a_different_host_than_the_saved_login(
+    fake_logger, nv_home
+):
+    server_folder = _installed_server(nv_home)
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(installer, "_download_server_package") as download:
+            assert (
+                installer.update(
+                    token="saved-token",
+                    server_name="abcdef",
+                    assume_yes=True,
+                    login_host="https://alfa.suite.novavision.ai",
+                )
+                is False
+            )
+    download.assert_not_called()
+    assert "image: old" in (server_folder / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert any(
+        "registered on https://suite.novavision.ai" in message
+        for message in fake_logger.messages_of("error")
+    )
