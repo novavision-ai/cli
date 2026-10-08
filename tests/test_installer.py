@@ -22,6 +22,14 @@ def test_format_host_keeps_https(fake_logger, nv_home):
     assert installer.format_host("https://suite.novavision.ai/") == "https://suite.novavision.ai/"
 
 
+def test_format_host_normalizes_case_and_default_port(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    assert (
+        installer.format_host("HTTPS://Suite.NovaVision.ai:443")
+        == "https://suite.novavision.ai/"
+    )
+
+
 def test_request_to_endpoint_sends_bearer_token(fake_logger, nv_home):
     installer = Installer(logger=fake_logger)
     response = Mock()

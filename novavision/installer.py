@@ -165,15 +165,7 @@ class Installer:
                 )
 
     def format_host(self, host):
-        # CLI'da girilen host parametresinin doğru formatta olup olmadığını kontrol et
-        host = host.strip()
-        if not host.startswith("https://"):
-            if host.startswith("http://"):
-                host = host[len("http://") :]
-            host = "https://" + host
-        if not host.endswith("/"):
-            host = host + "/"
-        return host
+        return canonical_host(host) + "/"
 
     def request_to_endpoint(
         self, method, endpoint, data=None, auth_token=None, timeout=None

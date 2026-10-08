@@ -124,7 +124,7 @@ class ConsoleLogger:
         self._write_file("info", message)
         if not self._should_print("info"):
             return
-        self.console.print(str(message), style="dim")
+        self.console.print(str(message), style="bright_black", markup=False)
 
     def success(self, message):
         if self._should_print("success"):

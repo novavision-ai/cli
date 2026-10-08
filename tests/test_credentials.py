@@ -50,6 +50,20 @@ def test_canonical_host_matches_saved_server_metadata():
     assert not hosts_match(
         "https://suite.novavision.ai", "https://alfa.suite.novavision.ai"
     )
+    assert canonical_host("HTTPS://Suite.NovaVision.ai:443/") == (
+        "https://suite.novavision.ai"
+    )
+    assert canonical_host("HTTP://SUITE.novavision.ai.") == "https://suite.novavision.ai"
+    assert hosts_match(
+        "HTTPS://Suite.NovaVision.ai:443", "http://suite.novavision.ai/"
+    )
+    assert (
+        canonical_host("https://suite.novavision.ai:8443")
+        == "https://suite.novavision.ai:8443"
+    )
+    assert not hosts_match(
+        "https://suite.novavision.ai:8443", "https://suite.novavision.ai"
+    )
 
 
 def test_verify_api_key_uses_profile_and_returns_username(monkeypatch):
@@ -78,6 +92,48 @@ def test_verify_api_key_rejects_an_invalid_key(monkeypatch):
     assert username is None
     assert "unauthorized" in error
     assert "401" in error
+    assert "rejected" in error
+
+
+def test_verify_api_key_reports_a_server_error(monkeypatch):
+    monkeypatch.setattr(
+        "novavision.credentials.requests.get",
+        lambda url, headers, timeout: _Response(500, {"message": "unavailable"}),
+    )
+    username, error = verify_api_key("https://suite.novavision.ai", "secret-key")
+    assert username is None
+    assert "rejected" not in error
+    assert "unavailable" in error
+    assert "500" in error
+
+
+def test_verify_api_key_reports_a_profile_without_a_username(monkeypatch):
+    monkeypatch.setattr(
+        "novavision.credentials.requests.get",
+        lambda url, headers, timeout: _Response(200, {"success": True, "user": {}}),
+    )
+    username, error = verify_api_key("https://suite.novavision.ai", "secret-key")
+    assert username is None
+    assert "rejected" not in error
+    assert "username" in error
+
+
+def test_lock_failure_does_not_keep_the_token(nv_home, monkeypatch):
+    monkeypatch.setattr("novavision.credentials.os.name", "nt")
+    monkeypatch.setenv("USERNAME", "selcuk")
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "denied"
+
+    monkeypatch.setattr(
+        "novavision.credentials.subprocess.run", lambda *args, **kwargs: _Failed()
+    )
+    with pytest.raises(CredentialsError):
+        save_credentials("https://suite.novavision.ai", "secret-key", "selcukoz")
+    assert not credentials_path().exists()
+    assert not credentials_path().with_name("credentials.tmp").exists()
 
 
 def test_saved_login_is_a_single_record_with_owner_only_permissions(nv_home):
@@ -250,7 +306,11 @@ def test_install_with_saved_login_uses_that_host_not_config(nv_home, monkeypatch
         captured.update(kwargs)
         return True
 
+    notes = []
     monkeypatch.setattr(Installer, "install", fake_install)
+    monkeypatch.setattr(
+        "novavision.cli.logger.note", lambda message: notes.append(message)
+    )
     args = (
         NovaVisionCLI()
         .create_parser()
@@ -260,6 +320,31 @@ def test_install_with_saved_login_uses_that_host_not_config(nv_home, monkeypatch
     assert captured["token"] == "saved-token"
     assert captured["host"] == "https://suite.novavision.ai"
     assert captured["workspace"] == "ci"
+    assert notes == ["selcukoz @ suite.novavision.ai"]
+
+
+def test_install_with_env_token_does_not_show_the_saved_login(nv_home, monkeypatch):
+    monkeypatch.setenv("NOVAVISION_TOKEN", "env-token")
+    save_credentials("https://suite.novavision.ai", "saved-token", "selcukoz")
+    captured = {}
+    notes = []
+
+    def fake_install(self, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(Installer, "install", fake_install)
+    monkeypatch.setattr(
+        "novavision.cli.logger.note", lambda message: notes.append(message)
+    )
+    args = (
+        NovaVisionCLI()
+        .create_parser()
+        .parse_args(["install", "local", "--non-interactive", "--workspace", "ci"])
+    )
+    NovaVisionCLI().handle_install(args)
+    assert captured["token"] == "env-token"
+    assert notes == []
 
 
 def test_install_rejects_explicit_host_that_differs_from_saved_login(

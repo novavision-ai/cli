@@ -514,7 +514,14 @@ class NovaVisionCLI:
             no_color=getattr(args, "no_color", False),
         )
 
-    def _show_active_login(self):
+    def _show_active_login(self, auth=None):
+        if auth is not None:
+            if auth.source != "credentials":
+                return
+            username = auth.username or "unknown"
+            host = canonical_host(auth.host).split("://", 1)[-1]
+            logger.note(f"{username} @ {host}")
+            return
         label = active_login_label()
         if label:
             logger.note(label)
@@ -576,8 +583,8 @@ class NovaVisionCLI:
         logger.info(f"{username} ({saved['host']})")
 
     def handle_install(self, args):
-        self._show_active_login()
         auth = self._require_auth(args)
+        self._show_active_login(auth)
         host, workspace = resolve_install_defaults(args.host, args.workspace)
         if auth.source == "credentials":
             if args.host is None:
@@ -612,8 +619,8 @@ class NovaVisionCLI:
             raise SystemExit(1)
 
     def handle_update(self, args):
-        self._show_active_login()
         auth = self._require_auth(args)
+        self._show_active_login(auth)
         log_dir = Path.home() / ".novavision"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = (
@@ -632,8 +639,8 @@ class NovaVisionCLI:
             raise SystemExit(1)
 
     def handle_uninstall(self, args):
-        self._show_active_login()
         auth = self._require_auth(args)
+        self._show_active_login(auth)
         log_dir = Path.home() / ".novavision"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = (

@@ -36,6 +36,24 @@ def test_print_stream_during_loading_keeps_docker_lines_separate():
             assert "Building server" not in rendered
 
 
+def test_note_uses_gray_instead_of_dim():
+    buf = StringIO()
+    logger = ConsoleLogger()
+    logger.console = Console(
+        file=buf,
+        force_terminal=True,
+        width=80,
+        color_system="standard",
+        highlight=False,
+        no_color=False,
+    )
+    logger.note("1 server on another host is not shown.")
+    output = buf.getvalue()
+    assert "1 server on another host is not shown." in output
+    assert "\x1b[90m" in output
+    assert "\x1b[2m" not in output
+
+
 def test_print_stream_without_loading_uses_console():
     buf = StringIO()
     logger = ConsoleLogger()
