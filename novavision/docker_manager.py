@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from rich.markup import escape
+from novavision.credentials import CredentialsError, hosts_match, load_credentials
 from novavision.host_metrics import start_host_metrics, stop_host_metrics
 from novavision.logger import ConsoleLogger
 
@@ -192,6 +193,39 @@ class DockerManager:
             rows.append(row)
         self.log.table(headers, rows)
 
+    def _saved_login_host(self):
+        try:
+            saved = load_credentials()
+        except CredentialsError as exc:
+            self.log.warning(str(exc))
+            return None
+        if not saved:
+            return None
+        return saved.get("host")
+
+    def _restrict_to_login_host(self, folders, metadata):
+        login_host = self._saved_login_host()
+        if not login_host:
+            return list(folders), 0, None
+        visible = []
+        hidden = 0
+        for folder in folders:
+            host = (metadata.get(folder.name) or {}).get("host")
+            if hosts_match(host, login_host):
+                visible.append(folder)
+            else:
+                hidden += 1
+        return visible, hidden, login_host
+
+    def _note_hidden_servers(self, count):
+        if count <= 0:
+            return
+        if count == 1:
+            message = "1 server on another host is not shown."
+        else:
+            message = f"{count} servers on other hosts are not shown."
+        self.log.note(message)
+
     def list_servers(self):
         folders = self._visible_server_folders(Path.home() / ".novavision" / "Server")
         if not folders:
@@ -208,6 +242,7 @@ class DockerManager:
         return True
 
     def show_status(self, server_name=None):
+        hidden = 0
         if server_name:
             folder = self.get_server_folder(server_name)
             if not folder:
@@ -219,6 +254,14 @@ class DockerManager:
             )
             if not folders:
                 self.log.error("No server folders found!")
+                return False
+            metadata = self._load_server_metadata()
+            folders, hidden, login_host = self._restrict_to_login_host(
+                folders, metadata
+            )
+            if not folders:
+                self.log.error(f"No servers found for {login_host}.")
+                self._note_hidden_servers(hidden)
                 return False
 
         metadata = self._load_server_metadata()
@@ -254,6 +297,8 @@ class DockerManager:
                 self.log.info(f"No apps found for server {record['id']}.")
         if json_mode:
             self.log.emit_json(payload[0] if server_name and payload else payload)
+        else:
+            self._note_hidden_servers(hidden)
         return True
 
     def show_logs(self, resource_type, resource_id, follow=False, tail=None):
@@ -315,15 +360,24 @@ class DockerManager:
         return f"[{color}]{glyph}[/{color}]"
 
     def choose_server_folder(self, server_path):
-        visible_folders = self._visible_server_folders(server_path)
+        folders = self._visible_server_folders(server_path)
         metadata = self._load_server_metadata()
 
-        if not visible_folders:
+        if not folders:
             self.log.error("No server folders found!")
+            return None
+
+        visible_folders, hidden, login_host = self._restrict_to_login_host(
+            folders, metadata
+        )
+        if not visible_folders:
+            self.log.error(f"No servers found for {login_host}.")
+            self._note_hidden_servers(hidden)
             return None
 
         records = [self._server_record(folder, metadata) for folder in visible_folders]
         self._print_server_table(records, numbered=len(visible_folders) > 1)
+        self._note_hidden_servers(hidden)
         if len(visible_folders) == 1:
             return visible_folders[0]
 

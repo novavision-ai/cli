@@ -10,6 +10,7 @@ import subprocess
 
 from datetime import datetime
 from pathlib import Path
+from novavision.credentials import canonical_host, hosts_match
 from novavision.host_metrics import start_host_metrics
 from novavision.logger import ConsoleLogger
 from novavision.utils import get_system_info
@@ -685,7 +686,25 @@ class Installer:
         )
         return False
 
-    def uninstall(self, token, server_name=None, assume_yes=False):
+    def _login_host_mismatch_message(self, server_host, login_host):
+        if not server_host:
+            return (
+                "Server metadata has no host, so it cannot be matched to the saved login."
+            )
+        return (
+            f"This server is registered on {canonical_host(server_host)}, "
+            f"but the saved login is for {canonical_host(login_host)}."
+        )
+
+    def _saved_login_matches_host(self, server_host, login_host):
+        if login_host is None:
+            return True
+        if server_host and hosts_match(server_host, login_host):
+            return True
+        self.log.error(self._login_host_mismatch_message(server_host, login_host))
+        return False
+
+    def uninstall(self, token, server_name=None, assume_yes=False, login_host=None):
         if not server_name:
             if self.non_interactive:
                 self.log.error("Server id is required in non-interactive mode.")
@@ -706,6 +725,8 @@ class Installer:
                     break
 
         server_folder = Path.home() / ".novavision" / "Server" / folder_name
+        if not self._saved_login_matches_host(server_meta.get("host"), login_host):
+            return False
         if not self._confirm_uninstall(folder_name, server_meta, assume_yes):
             return False
         if not self._confirm_server_service_disabled(folder_name, server_meta):
@@ -750,19 +771,27 @@ class Installer:
             stop_update_listener(self.log)
         return True
 
-    def update(self, token, server_name=None, assume_yes=False):
+    def update(self, token, server_name=None, assume_yes=False, login_host=None):
         if not self._acquire_update_lock():
             self.log.error("An update is already running.")
             return False
         try:
             return self._run_server_update(
-                token, server_name=server_name, assume_yes=assume_yes
+                token,
+                server_name=server_name,
+                assume_yes=assume_yes,
+                login_host=login_host,
             )["ok"]
         finally:
             self._release_update_lock()
 
     def _run_server_update(
-        self, token, server_name=None, assume_yes=False, package_id=None
+        self,
+        token,
+        server_name=None,
+        assume_yes=False,
+        package_id=None,
+        login_host=None,
     ):
         """Download a server package and rebuild that server in place.
 
@@ -805,6 +834,10 @@ class Installer:
             )
             self.log.error(message)
             return self._finish_update(False, self._error_report(message))
+
+        if not self._saved_login_matches_host(host, login_host):
+            mismatch = self._login_host_mismatch_message(host, login_host)
+            return self._finish_update(False, self._error_report(mismatch))
 
         if not self._confirm_update(folder_name, server_meta, assume_yes):
             return {"ok": False, "report": None}
