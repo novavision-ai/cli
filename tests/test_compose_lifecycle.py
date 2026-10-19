@@ -1,3 +1,4 @@
+import os
 import time
 import shutil
 import subprocess
@@ -40,6 +41,24 @@ pytestmark = [
         reason="Linux containers are not available",
     ),
 ]
+
+
+@pytest.fixture
+def nv_home(monkeypatch):
+    """Home under the real user home so Colima can mount the metrics files."""
+    root = Path.home() / ".novavision-test"
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    home = root / "home"
+    home.mkdir(parents=True)
+    docker_host = os.environ.get("DOCKER_HOST")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda *args, **kwargs: home)
+    if docker_host:
+        monkeypatch.setenv("DOCKER_HOST", docker_host)
+    yield home
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _seed_server(nv_home):

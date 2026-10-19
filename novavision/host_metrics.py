@@ -217,7 +217,7 @@ def _publisher_inspect():
     return payload if isinstance(payload, dict) else None
 
 
-def _publisher_responds(port, timeout=2):
+def _host_publisher_responds(port, timeout=2):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
@@ -237,16 +237,58 @@ def _publisher_responds(port, timeout=2):
     return status.startswith(b"HTTP/1.") and b" 200 " in status
 
 
+def _container_publisher_responds(port, timeout=5):
+    """Ask from a container, which is how the websocket reaches metrics.
+
+    Colima does not always open published ports on the Mac's own loopback.
+    """
+    if not shutil.which("docker"):
+        return False
+    url = "http://{0}:{1}/metrics".format(HOST_METRICS_HOSTNAME, int(port))
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--add-host",
+                "{0}:host-gateway".format(HOST_METRICS_HOSTNAME),
+                PUBLISHER_IMAGE,
+                "wget",
+                "-q",
+                "-T",
+                str(max(1, int(timeout))),
+                "-O",
+                "-",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(10, int(timeout) + 15),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and (result.stdout or "").lstrip().startswith("{")
+
+
+def _publisher_responds(port, timeout=2):
+    if _host_publisher_responds(port, timeout=timeout):
+        return True
+    return _container_publisher_responds(port, timeout=max(timeout, 3))
+
+
 def publisher_is_responding(port=DEFAULT_PORT):
     return _publisher_responds(port)
 
 
 def _wait_for_publisher(port):
-    for _ in range(15):
-        if _publisher_responds(port, timeout=0.5):
+    for _ in range(10):
+        if _host_publisher_responds(port, timeout=0.5):
             return True
         time.sleep(0.2)
-    return False
+    return _container_publisher_responds(port, timeout=5)
 
 
 def _publisher_is_current(port):

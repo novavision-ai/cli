@@ -10,6 +10,7 @@ from novavision.host_metrics import (
     _nvidia_smi_gpus,
     ensure_metrics_publisher,
     is_agent_running,
+    publisher_is_responding,
     make_handler,
     metrics_url,
     start_host_metrics,
@@ -166,7 +167,7 @@ def test_metrics_publisher_uses_docker_not_the_firewall(fake_logger, nv_home):
 
     with patch("novavision.host_metrics.shutil.which", return_value="docker"):
         with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
-            with patch("novavision.host_metrics._publisher_responds", return_value=True):
+            with patch("novavision.host_metrics._wait_for_publisher", return_value=True):
                 assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is True
 
     assert not any(args[0] in ("netsh", "sudo") for args in calls)
@@ -205,7 +206,7 @@ def test_metrics_publisher_replaces_a_stuck_container(fake_logger, nv_home):
 
     with patch("novavision.host_metrics.shutil.which", return_value="docker"):
         with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
-            with patch("novavision.host_metrics._publisher_responds", return_value=True):
+            with patch("novavision.host_metrics._wait_for_publisher", return_value=True):
                 assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is True
 
     assert ["docker", "rm", "-f", "novavision-host-metrics"] in calls
@@ -253,6 +254,18 @@ def test_metrics_publisher_fails_when_it_does_not_respond(fake_logger, nv_home):
     assert any(
         "did not respond" in message for message in fake_logger.messages_of("warning")
     )
+
+
+def test_publisher_probe_falls_back_to_a_container():
+    with patch(
+        "novavision.host_metrics._host_publisher_responds", return_value=False
+    ):
+        with patch(
+            "novavision.host_metrics._container_publisher_responds",
+            return_value=True,
+        ) as probe:
+            assert publisher_is_responding(DEFAULT_PORT) is True
+    probe.assert_called_once()
 
 
 def test_start_host_metrics_stops_when_publisher_fails(fake_logger, nv_home):
