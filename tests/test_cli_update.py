@@ -135,11 +135,14 @@ def test_install_kind_detects_editable_pipx_and_pip(monkeypatch):
 
     monkeypatch.setattr("novavision.cli_update.is_pipx_install", lambda: False)
     assert install_kind() == "pip"
-    assert running_outside_site_packages(
-        r"C:\Python\Lib\site-packages\novavision\cli_update.py"
-    ) is False
-    assert is_pipx_install(r"C:\Users\me\.local\pipx\venvs\novavision-cli")
-    assert not is_pipx_install(r"C:\Python\Lib\site-packages")
+    assert (
+        running_outside_site_packages(
+            "C:/Python/Lib/site-packages/novavision/cli_update.py"
+        )
+        is False
+    )
+    assert is_pipx_install("C:/Users/me/.local/pipx/venvs/novavision-cli")
+    assert not is_pipx_install("C:/Python/Lib/site-packages")
 
 
 def test_upgrade_command_uses_pipx_when_it_is_installed(monkeypatch):
