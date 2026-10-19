@@ -8,6 +8,24 @@ def config_path():
     return Path.home() / ".novavision" / "config.json"
 
 
+def logs_dir():
+    root = Path.home() / ".novavision"
+    path = root / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    if root.is_dir():
+        for child in root.iterdir():
+            if not child.is_file() or child.suffix.lower() != ".log":
+                continue
+            target = path / child.name
+            if target.exists():
+                continue
+            try:
+                child.replace(target)
+            except OSError:
+                pass
+    return path
+
+
 def load_config():
     path = config_path()
     if not path.exists():

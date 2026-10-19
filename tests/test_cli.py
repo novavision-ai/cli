@@ -37,6 +37,11 @@ def test_login_logout_and_whoami_parse():
     assert parser.parse_args(["whoami"]).command == "whoami"
 
 
+def test_self_update_parses():
+    args = _parser().parse_args(["self-update"])
+    assert args.command == "self-update"
+
+
 def test_update_and_uninstall_token_is_optional():
     parser = _parser()
     update = parser.parse_args(["update", "server", "--id", "abcdef", "--yes"])

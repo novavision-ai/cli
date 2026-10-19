@@ -10,6 +10,8 @@ from pathlib import Path
 
 import requests
 
+from novavision.config import logs_dir
+
 PING_SECONDS = 30
 RETRY_SECONDS = 5
 MQTT_KEYS = ("mqtt_host", "mqtt_port", "mqtt_token", "mqtt_channel")
@@ -197,7 +199,7 @@ def _pid_path():
 
 
 def _log_path():
-    return Path.home() / ".novavision" / "update-listener.log"
+    return logs_dir() / "update-listener.log"
 
 
 def _read_pid():

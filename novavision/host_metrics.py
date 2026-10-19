@@ -14,6 +14,8 @@ from pathlib import Path
 
 import psutil
 
+from novavision.config import logs_dir
+
 DEFAULT_PORT = 18765
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_INTERVAL = 2.0
@@ -42,7 +44,7 @@ def pid_path():
 
 
 def log_path():
-    return state_dir() / LOG_NAME
+    return logs_dir() / LOG_NAME
 
 
 def load_state():
