@@ -414,6 +414,14 @@ class DockerManager:
             self.log.error(f"No docker-compose.yml found in {server_folder}!")
             return False
 
+        other = self._other_running_server(server_folder)
+        if other is not None:
+            self.log.error(
+                f"Server {other.name} is already running. "
+                f"Stop it before starting {server_folder.name}."
+            )
+            return False
+
         start_host_metrics(self.log)
         started = self._start_server(docker_compose_file, retries=retries)
         if not started:
@@ -430,9 +438,9 @@ class DockerManager:
             return False
 
         try:
-            self.run_docker_compose(docker_compose_file, "down", "--volumes")
+            removed = self._bring_server_down(docker_compose_file)
             self.log.success("Server stopped.")
-            if self.remove_network():
+            if removed:
                 self.log.success("Server network removed successfully.")
             self._stop_host_metrics_if_idle()
             return True
@@ -441,28 +449,225 @@ class DockerManager:
             self._stop_host_metrics_if_idle()
             return False
 
-    def remove_network(self):
+    def _error_is_network_in_use(self, error):
+        text = " ".join(
+            part
+            for part in (
+                getattr(error, "stderr", None),
+                getattr(error, "stdout", None),
+                str(error),
+            )
+            if part
+        ).lower()
+        return "active endpoint" in text or ("network" in text and "in use" in text)
+
+    def _bring_server_down(self, compose_file):
+        down_error = None
         try:
+            self.run_docker_compose(compose_file, "down", "--volumes")
+        except subprocess.CalledProcessError as error:
+            down_error = error
+        removed = self.remove_network(compose_file)
+        if down_error and not self._error_is_network_in_use(down_error):
+            raise down_error
+        return removed
+
+    def _containers_on_network(self, name):
+        result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"network={name}",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.State}}",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        containers = []
+        if result.returncode != 0:
+            return containers
+        for line in result.stdout.splitlines():
+            container_id, _, rest = line.strip().partition("\t")
+            container_name, _, state = rest.partition("\t")
+            if container_id:
+                containers.append(
+                    (container_id, container_name or container_id, state or "")
+                )
+        return containers
+
+    def _network_can_be_released(self, state):
+        return state.lower() in ("exited", "dead", "created")
+
+    def _network_docker_name(self, key, config):
+        if not isinstance(config, dict):
+            return str(key)
+        external = config.get("external")
+        if isinstance(external, dict) and external.get("name"):
+            return str(external["name"])
+        if config.get("name"):
+            return str(config["name"])
+        return str(key)
+
+    def _compose_network_names(self, compose_file):
+        names = []
+        for key, config in (
+            self._load_compose_yaml(compose_file).get("networks") or {}
+        ).items():
+            name = self._network_docker_name(key, config)
+            if name.endswith("-novavision"):
+                names.append(name)
+        return names
+
+    def _server_network_names(self, compose_file):
+        compose_file = Path(compose_file)
+        names = list(self._compose_network_names(compose_file))
+        for app_file in self._server_app_compose_files(compose_file.parent).values():
+            names.extend(self._compose_network_names(app_file))
+        seen = []
+        for name in names:
+            if name not in seen:
+                seen.append(name)
+        return seen
+
+    def _owned_container_names(self, compose_file):
+        compose_file = Path(compose_file)
+        names = {name for _, name in self._compose_service_containers(compose_file)}
+        for app_file in self._server_app_compose_files(compose_file.parent).values():
+            names.update(
+                name for _, name in self._compose_service_containers(app_file)
+            )
+        return names
+
+    def _service_network_names(self, compose_file, service):
+        data = self._load_compose_yaml(compose_file)
+        services = data.get("services") or {}
+        config = services.get(service) if isinstance(services, dict) else None
+        if not isinstance(config, dict):
+            config = {}
+        key_to_name = {}
+        for key, net_config in (data.get("networks") or {}).items():
+            key_to_name[str(key)] = self._network_docker_name(key, net_config)
+        selected = config.get("networks")
+        if isinstance(selected, list):
+            keys = [str(item) for item in selected]
+        elif isinstance(selected, dict):
+            keys = [str(item) for item in selected]
+        else:
+            keys = list(key_to_name)
+        return [
+            key_to_name.get(key, key)
+            for key in keys
+            if key_to_name.get(key, key).endswith("-novavision")
+        ]
+
+    def _container_network_names(self, container):
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{json .NetworkSettings.Networks}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            return set()
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return set()
+        if not isinstance(payload, dict):
+            return set()
+        return set(payload)
+
+    def _ensure_container_networks(self, container, networks):
+        connected = self._container_network_names(container)
+        for network in networks:
+            if network in connected:
+                continue
             result = subprocess.run(
-                ["docker", "network", "ls", "--format", "{{.Name}}"],
+                ["docker", "network", "connect", network, container],
                 capture_output=True,
                 text=True,
-                check=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            network_names = result.stdout.strip().split("\n")
-            for net in network_names:
-                if net.endswith("-novavision"):
-                    try:
-                        subprocess.run(["docker", "network", "rm", net], check=True)
-                        self.log.success(f"Removed network: {net}")
-                    except subprocess.CalledProcessError:
-                        self.log.warning(
-                            f"Failed to remove network (maybe already removed): {net}"
-                        )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                self.log.warning(
+                    f"Could not attach {container} to {network}."
+                    + (f" {detail}" if detail else "")
+                )
+
+    def _remove_one_network(self, name, owned_names):
+        last_detail = ""
+        for _ in range(5):
+            containers = self._containers_on_network(name)
+            releasable = []
+            busy = []
+            for container_id, container_name, state in containers:
+                if (
+                    container_name in owned_names
+                    and self._network_can_be_released(state)
+                ):
+                    releasable.append(container_id)
+                    continue
+                busy.append(container_name)
+            if busy:
+                self.log.warning(
+                    f"Network {name} is still used by {', '.join(busy)}."
+                )
+                return False
+            for container_id in releasable:
+                subprocess.run(
+                    ["docker", "network", "disconnect", "-f", name, container_id],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            result = subprocess.run(
+                ["docker", "network", "rm", name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode == 0:
+                self.log.success(f"Removed network: {name}")
+                return True
+            last_detail = (result.stderr or result.stdout or "").strip()
+            if "not found" in last_detail.lower():
+                return True
+            time.sleep(0.4)
+        self.log.warning(
+            f"Failed to remove network {name}."
+            + (f" {last_detail}" if last_detail else "")
+        )
+        return False
+
+    def remove_network(self, compose_file):
+        names = self._server_network_names(compose_file)
+        if not names:
             return True
-        except subprocess.CalledProcessError as e:
-            self.log.error(f"Error listing networks: {e}")
-            return False
+        existing = self._docker_network_names()
+        owned = self._owned_container_names(compose_file)
+        removed = True
+        for name in names:
+            if name not in existing:
+                continue
+            if not self._remove_one_network(name, owned):
+                removed = False
+        return removed
 
     def get_docker_build_info(self, compose_file):
         try:
@@ -558,6 +763,36 @@ class DockerManager:
             return ["docker-compose"]
         return None
 
+    def _without_obsolete_compose_version(self, text):
+        lines = text.splitlines(keepends=True)
+        kept = []
+        removed = False
+        for line in lines:
+            if not removed and re.match(r"^version\s*:", line):
+                removed = True
+                continue
+            kept.append(line)
+        if not removed:
+            return None
+        return "".join(kept)
+
+    def _compose_file_for_invocation(self, compose_file):
+        compose_file = Path(compose_file)
+        stripped_path = compose_file.parent / ".novavision-compose.base.yml"
+        try:
+            text = compose_file.read_text(encoding="utf-8")
+        except OSError:
+            return compose_file
+        stripped = self._without_obsolete_compose_version(text)
+        if stripped is None:
+            try:
+                stripped_path.unlink()
+            except OSError:
+                pass
+            return compose_file
+        stripped_path.write_text(stripped, encoding="utf-8")
+        return stripped_path
+
     def _compose_invocation(
         self, compose_file, *args, extra_global=None, extra_files=None
     ):
@@ -574,7 +809,7 @@ class DockerManager:
                 "--project-directory",
                 str(compose_file.parent),
                 "-f",
-                str(compose_file),
+                str(self._compose_file_for_invocation(compose_file)),
             ]
         )
         for extra_file in extra_files or []:
@@ -920,6 +1155,9 @@ class DockerManager:
             if running:
                 self.log.info(f"Container {name} is already running.")
                 continue
+            self._ensure_container_networks(
+                name, self._service_network_names(compose_file, service)
+            )
             self.log.info(f"Starting existing container {name}")
             result = subprocess.run(
                 ["docker", "start", name],
@@ -1238,6 +1476,16 @@ class DockerManager:
             return False
         return self._compose_is_running(Path(server_folder) / "docker-compose.yml")
 
+    def _other_running_server(self, server_folder):
+        server_path = Path.home() / ".novavision" / "Server"
+        target = Path(server_folder).resolve()
+        for folder in self._visible_server_folders(server_path):
+            if folder.resolve() == target:
+                continue
+            if self._server_is_running(folder):
+                return folder
+        return None
+
     def _stop_host_metrics_if_idle(self):
         server_path = Path.home() / ".novavision" / "Server"
         for folder in self._visible_server_folders(server_path):
@@ -1413,9 +1661,9 @@ class DockerManager:
                 if close_apps:
                     self.close_server_apps(folder)
                 try:
-                    self.run_docker_compose(docker_compose_file, "down", "--volumes")
+                    removed = self._bring_server_down(docker_compose_file)
                     self.log.success(f"Server {folder.name} stopped.")
-                    if self.remove_network():
+                    if removed:
                         self.log.success(
                             f"Server {folder.name} network removed successfully."
                         )

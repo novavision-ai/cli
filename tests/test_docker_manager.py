@@ -185,6 +185,28 @@ def test_start_server_folder_starts_host_metrics(fake_logger, nv_home):
     start.assert_called_once()
 
 
+def test_start_server_folder_rejects_a_second_running_server(fake_logger, nv_home):
+    server_path = nv_home / ".novavision" / "Server"
+    first = server_path / "aaaaaa"
+    second = server_path / "bbbbbb"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (second / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+
+    def running(folder):
+        return folder.name == "aaaaaa"
+
+    with patch.object(manager, "_server_is_running", side_effect=running):
+        with patch.object(manager, "_start_server") as start:
+            assert manager.start_server_folder(second) is False
+    start.assert_not_called()
+    assert any(
+        "aaaaaa is already running" in message
+        for message in fake_logger.messages_of("error")
+    )
+
+
 def test_start_server_folder_continues_without_host_metrics(fake_logger, nv_home):
     server_folder = nv_home / ".novavision" / "Server" / "ci-server"
     server_folder.mkdir(parents=True)
@@ -211,6 +233,145 @@ def test_metrics_publisher_problem_reports_a_silent_endpoint(fake_logger):
     assert problem and "not responding" in problem
     with patch("novavision.docker_manager.publisher_is_responding", return_value=True):
         assert manager.metrics_publisher_problem() is None
+
+
+def _server_compose(folder, container_name):
+    folder.mkdir(parents=True, exist_ok=True)
+    compose_file = folder / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  app:\n"
+        "    container_name: {0}\n"
+        "    networks:\n"
+        "      - novavision\n"
+        "networks:\n"
+        "  novavision:\n"
+        "    name: demo-novavision\n".format(container_name),
+        encoding="utf-8",
+    )
+    return compose_file
+
+
+def test_remove_network_disconnects_this_servers_stopped_containers(
+    fake_logger, tmp_path
+):
+    compose_file = _server_compose(tmp_path, "old-app")
+    manager = DockerManager(logger=fake_logger)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:3] == ["docker", "network", "ls"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="demo-novavision\nother-novavision\n", stderr=""
+            )
+        if args[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="abc\told-app\texited\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="demo-novavision\n", stderr="")
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+        with patch("novavision.docker_manager.time.sleep"):
+            assert manager.remove_network(compose_file) is True
+
+    assert ["docker", "network", "disconnect", "-f", "demo-novavision", "abc"] in calls
+    assert ["docker", "network", "rm", "demo-novavision"] in calls
+    assert not any("other-novavision" in args for args in calls)
+
+
+def test_remove_network_leaves_another_servers_container(fake_logger, tmp_path):
+    compose_file = _server_compose(tmp_path, "old-app")
+    manager = DockerManager(logger=fake_logger)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:3] == ["docker", "network", "ls"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="demo-novavision\n", stderr=""
+            )
+        if args[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="abc\tother-server-app\texited\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+        assert manager.remove_network(compose_file) is False
+
+    assert not any(args[:3] == ["docker", "network", "disconnect"] for args in calls)
+    assert not any(args[:3] == ["docker", "network", "rm"] for args in calls)
+    assert any(
+        "other-server-app" in message for message in fake_logger.messages_of("warning")
+    )
+
+
+def test_remove_network_keeps_a_network_with_a_running_container(fake_logger, tmp_path):
+    compose_file = _server_compose(tmp_path, "live-app")
+    manager = DockerManager(logger=fake_logger)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:3] == ["docker", "network", "ls"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="demo-novavision\n", stderr=""
+            )
+        if args[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="abc\tlive-app\trunning\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+        assert manager.remove_network(compose_file) is False
+
+    assert not any(args[:3] == ["docker", "network", "rm"] for args in calls)
+    assert any(
+        "live-app" in message for message in fake_logger.messages_of("warning")
+    )
+
+
+def test_start_existing_container_rejoins_server_network(fake_logger, tmp_path):
+    compose_file = _server_compose(tmp_path, "old-app")
+    manager = DockerManager(logger=fake_logger)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    with patch.object(manager, "_container_running_state", return_value=False):
+        with patch.object(manager, "_container_network_names", return_value=set()):
+            with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+                assert manager._start_existing_named_containers(compose_file) == []
+
+    connect = ["docker", "network", "connect", "demo-novavision", "old-app"]
+    start = ["docker", "start", "old-app"]
+    assert connect in calls
+    assert start in calls
+    assert calls.index(connect) < calls.index(start)
+
+
+def test_stop_server_folder_accepts_a_busy_network(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "ci-server"
+    server_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+
+    def fail_down(*args, **kwargs):
+        error = subprocess.CalledProcessError(1, args)
+        error.stderr = "error while removing network: has active endpoints"
+        raise error
+
+    with patch.object(manager, "run_docker_compose", side_effect=fail_down):
+        with patch.object(manager, "remove_network", return_value=True):
+            with patch("novavision.docker_manager.stop_host_metrics"):
+                assert manager.stop_server_folder(server_folder) is True
+    assert any(
+        "Server stopped." in message for message in fake_logger.messages_of("success")
+    )
 
 
 def test_stop_server_folder_stops_idle_host_metrics(fake_logger, nv_home):
@@ -562,6 +723,30 @@ def test_compose_invocation_sets_project_directory(fake_logger, tmp_path):
         str(compose_file),
     ]
     assert command[6:] == ["up", "-d"]
+
+
+def test_compose_invocation_hides_obsolete_version_warning(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "version: '3'\nservices:\n  app:\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch(
+        "novavision.docker_manager.shutil.which",
+        side_effect=lambda name: name == "docker",
+    ):
+        command = manager._compose_invocation(compose_file, "down")
+    stripped = tmp_path / ".novavision-compose.base.yml"
+    assert command[2:6] == [
+        "--project-directory",
+        str(tmp_path),
+        "-f",
+        str(stripped),
+    ]
+    assert "version:" not in stripped.read_text(encoding="utf-8")
+    assert "image: alpine:3.20" in stripped.read_text(encoding="utf-8")
+    assert compose_file.read_text(encoding="utf-8").startswith("version:")
 
 
 def test_external_networks_override_marks_existing_named_networks(fake_logger, tmp_path):
