@@ -1,3 +1,5 @@
+import os
+import time
 import shutil
 import subprocess
 from pathlib import Path
@@ -41,6 +43,24 @@ pytestmark = [
 ]
 
 
+@pytest.fixture
+def nv_home(monkeypatch):
+    """Home under the real user home so Colima can mount the metrics files."""
+    root = Path.home() / ".novavision-test"
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    home = root / "home"
+    home.mkdir(parents=True)
+    docker_host = os.environ.get("DOCKER_HOST")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda *args, **kwargs: home)
+    if docker_host:
+        monkeypatch.setenv("DOCKER_HOST", docker_host)
+    yield home
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _seed_server(nv_home):
     server_folder = nv_home / ".novavision" / "Server" / "ci-server"
     app_folder = server_folder / "demo"
@@ -62,6 +82,12 @@ def test_compose_start_app_and_stop(fake_logger, nv_home):
     try:
         assert manager.start_server_folder(server_folder) is True
         assert manager._server_is_running(server_folder) is True
+        time.sleep(15)
+        crashed = manager.crashed_containers(server_folder / "docker-compose.yml")
+        metrics = manager.metrics_publisher_problem()
+        if metrics:
+            crashed.append(metrics)
+        assert crashed == [], crashed
         assert manager._start_app("demo") is True
         assert manager._stop_app("demo") is True
     finally:

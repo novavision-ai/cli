@@ -13,7 +13,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 from rich.markup import escape
 from novavision.credentials import CredentialsError, hosts_match, load_credentials
-from novavision.host_metrics import start_host_metrics, stop_host_metrics
+from novavision.host_metrics import (
+    DEFAULT_PORT,
+    publisher_is_responding,
+    start_host_metrics,
+    stop_host_metrics,
+)
 from novavision.logger import ConsoleLogger
 
 # CSI / OSC sequences from BuildKit and pip progress bars.
@@ -638,6 +643,43 @@ class DockerManager:
         )
         return override_path
 
+    def _needs_host_gateway(self):
+        # Docker Desktop on Windows already defines this name. Linux Docker
+        # Engine and Colima do not.
+        return sys.platform in ("linux", "darwin")
+
+    def _host_gateway_override(self, compose_file):
+        if not self._needs_host_gateway():
+            return None
+
+        compose_file = Path(compose_file)
+        services = self._load_compose_yaml(compose_file).get("services") or {}
+        override_services = {
+            key: {"extra_hosts": ["host.docker.internal:host-gateway"]}
+            for key, config in services.items()
+            if isinstance(config, dict)
+        }
+        override_path = compose_file.parent / ".novavision-compose.hosts.yml"
+        if not override_services:
+            try:
+                override_path.unlink()
+            except OSError:
+                pass
+            return None
+
+        override_path.write_text(
+            yaml.safe_dump(
+                {"services": override_services},
+                default_flow_style=False,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        self.log.info(
+            "Publishing host.docker.internal so containers can reach the host."
+        )
+        return override_path
+
     def run_docker_compose(self, compose_file, *args, capture=None):
         should_capture = capture
         if should_capture is None:
@@ -657,9 +699,14 @@ class DockerManager:
         ):
             extra_global = ["--progress", "plain"]
         if args and args[0] == "up":
-            override = self._external_networks_override(compose_file)
-            if override:
-                extra_files = [override]
+            extra_files = []
+            networks = self._external_networks_override(compose_file)
+            if networks:
+                extra_files.append(networks)
+            hosts = self._host_gateway_override(compose_file)
+            if hosts:
+                extra_files.append(hosts)
+            extra_files = extra_files or None
 
         command = self._compose_invocation(
             compose_file, *args, extra_global=extra_global, extra_files=extra_files
@@ -897,6 +944,74 @@ class DockerManager:
             )
             missing.append(service)
         return missing
+
+    def crashed_containers(self, compose_file):
+        """Services that are not running after launch.
+
+        A clean exit is a finished one-shot container. A running container is
+        available, including one that already restarted. This matches the
+        running check used by status and stack readiness.
+        """
+        command = self._compose_invocation(compose_file, "ps", "-a", "--format", "json")
+        if not command:
+            return ["Docker Compose is not available."]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "docker compose ps failed").strip()
+            return [detail]
+
+        rows = []
+        raw = (result.stdout or "").strip()
+        if raw:
+            try:
+                if raw.startswith("["):
+                    parsed = json.loads(raw)
+                    rows = parsed if isinstance(parsed, list) else [parsed]
+                else:
+                    rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            except json.JSONDecodeError:
+                return ["Could not read docker compose ps output."]
+
+        seen = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get("Service"):
+                seen[str(row["Service"])] = row
+
+        failures = []
+        for service, _name in self._compose_service_containers(compose_file):
+            row = seen.get(service)
+            if not row:
+                failures.append(f"{service} (not created)")
+                continue
+            state = str(row.get("State") or "").lower()
+            exit_code = row.get("ExitCode")
+            try:
+                exit_code = int(exit_code)
+            except (TypeError, ValueError):
+                exit_code = None
+            if state == "running":
+                continue
+            if state in ("exited", "dead") and exit_code == 0:
+                continue
+            exit_label = "unknown" if exit_code is None else str(exit_code)
+            failures.append(f"{service} ({state or 'unknown'}, exit {exit_label})")
+        return failures
+
+    def metrics_publisher_problem(self):
+        if publisher_is_responding(DEFAULT_PORT):
+            return None
+        return (
+            "Host metrics publisher is not responding on port {0}.".format(
+                DEFAULT_PORT
+            )
+        )
 
     def _ready_ports(self, folder):
         env = self._read_env_file(folder)

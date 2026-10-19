@@ -4,6 +4,16 @@ services:
     command: ["sleep", "infinity"]
     networks:
       - novavision
+  wsl:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        wget -q -T 2 -O /dev/null http://host.docker.internal:18765/metrics || true
+        exec sleep infinity
+    networks:
+      - novavision
 
 networks:
   novavision:

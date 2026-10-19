@@ -185,6 +185,34 @@ def test_start_server_folder_starts_host_metrics(fake_logger, nv_home):
     start.assert_called_once()
 
 
+def test_start_server_folder_continues_without_host_metrics(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "ci-server"
+    server_folder.mkdir(parents=True)
+    (server_folder / "docker-compose.yml").write_text(
+        "services:\n  nv-server:\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_start_server", return_value=True) as start:
+        with patch(
+            "novavision.docker_manager.start_host_metrics",
+            return_value=None,
+        ):
+            assert manager.start_server_folder(server_folder) is True
+    start.assert_called_once()
+
+
+def test_metrics_publisher_problem_reports_a_silent_endpoint(fake_logger):
+    manager = DockerManager(logger=fake_logger)
+    with patch(
+        "novavision.docker_manager.publisher_is_responding", return_value=False
+    ):
+        problem = manager.metrics_publisher_problem()
+    assert problem and "not responding" in problem
+    with patch("novavision.docker_manager.publisher_is_responding", return_value=True):
+        assert manager.metrics_publisher_problem() is None
+
+
 def test_stop_server_folder_stops_idle_host_metrics(fake_logger, nv_home):
     server_folder = nv_home / ".novavision" / "Server" / "ci-server"
     server_folder.mkdir(parents=True)
@@ -868,3 +896,89 @@ def test_stale_container_is_removed_and_recreated(fake_logger, tmp_path):
     assert any(
         "recreating it" in message for message in fake_logger.messages_of("warning")
     )
+
+
+def test_host_gateway_override_on_linux_and_mac(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n  wsl:\n    image: alpine\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch("novavision.docker_manager.sys.platform", "win32"):
+        assert manager._host_gateway_override(compose_file) is None
+
+    with patch("novavision.docker_manager.sys.platform", "linux"):
+        override = manager._host_gateway_override(compose_file)
+    data = yaml.safe_load(override.read_text(encoding="utf-8"))
+    assert data["services"]["wsl"]["extra_hosts"] == [
+        "host.docker.internal:host-gateway"
+    ]
+
+
+def test_crashed_containers_flags_bad_exit(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  wsl:\n"
+        "    image: alpine\n"
+        "  worker:\n"
+        "    image: alpine\n"
+        "  boot:\n"
+        "    image: alpine\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    ps_output = "\n".join(
+        [
+            json.dumps(
+                {"Service": "wsl", "Name": "wsl-1", "State": "exited", "ExitCode": 1}
+            ),
+            json.dumps(
+                {
+                    "Service": "worker",
+                    "Name": "worker-1",
+                    "State": "running",
+                    "ExitCode": 0,
+                }
+            ),
+            json.dumps(
+                {
+                    "Service": "boot",
+                    "Name": "boot-1",
+                    "State": "restarting",
+                    "ExitCode": 1,
+                }
+            ),
+        ]
+    )
+
+    with patch.object(manager, "_compose_invocation", return_value=["docker", "compose", "ps"]):
+        with patch(
+            "novavision.docker_manager.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["docker", "compose", "ps"], 0, stdout=ps_output, stderr=""
+            ),
+        ):
+            failed = manager.crashed_containers(compose_file)
+    assert "wsl (exited, exit 1)" in failed
+    assert "boot (restarting, exit 1)" in failed
+    assert all(not item.startswith("worker") for item in failed)
+
+
+def test_crashed_containers_ignores_successful_exit(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  init:\n    image: alpine\n", encoding="utf-8")
+    manager = DockerManager(logger=fake_logger)
+    ps_output = json.dumps(
+        {"Service": "init", "Name": "init-1", "State": "exited", "ExitCode": 0}
+    )
+
+    with patch.object(manager, "_compose_invocation", return_value=["docker", "compose", "ps"]):
+        with patch(
+            "novavision.docker_manager.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["docker", "compose", "ps"], 0, stdout=ps_output, stderr=""
+            ),
+        ):
+            assert manager.crashed_containers(compose_file) == []

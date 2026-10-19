@@ -113,6 +113,22 @@ jobs:
       - name: CLI start/stop against real Docker
         run: |
           novavision start server
+          python - <<'PY'
+          import time
+          from pathlib import Path
+          from novavision.docker_manager import DockerManager
+          from novavision.logger import ConsoleLogger
+
+          time.sleep(15)
+          compose = Path.home() / ".novavision" / "Server" / "ci-server" / "docker-compose.yml"
+          manager = DockerManager(ConsoleLogger())
+          failed = manager.crashed_containers(compose)
+          metrics = manager.metrics_publisher_problem()
+          if metrics:
+              failed.append(metrics)
+          if failed:
+              raise SystemExit("Server containers crashed:\n" + "\n".join(failed))
+          PY
           novavision start app --id demo
           novavision stop app --id demo
           novavision stop server --close-apps
@@ -218,6 +234,29 @@ jobs:
             exit 1
           fi
           novavision start server --id "$live_id"
+          python - <<'PY'
+          import os
+          import time
+          from pathlib import Path
+          from novavision.docker_manager import DockerManager
+          from novavision.logger import ConsoleLogger
+
+          time.sleep(20)
+          compose = (
+              Path.home()
+              / ".novavision"
+              / "Server"
+              / os.environ["LIVE_SERVER"]
+              / "docker-compose.yml"
+          )
+          manager = DockerManager(ConsoleLogger())
+          failed = manager.crashed_containers(compose)
+          metrics = manager.metrics_publisher_problem()
+          if metrics:
+              failed.append(metrics)
+          if failed:
+              raise SystemExit("Server containers crashed:\n" + "\n".join(failed))
+          PY
           app_id="$(python - <<'PY'
           import os
           from pathlib import Path
@@ -415,6 +454,22 @@ jobs:
       - name: CLI start/stop against real Docker
         run: |
           novavision start server
+          python - <<'PY'
+          import time
+          from pathlib import Path
+          from novavision.docker_manager import DockerManager
+          from novavision.logger import ConsoleLogger
+
+          time.sleep(15)
+          compose = Path.home() / ".novavision" / "Server" / "ci-server" / "docker-compose.yml"
+          manager = DockerManager(ConsoleLogger())
+          failed = manager.crashed_containers(compose)
+          metrics = manager.metrics_publisher_problem()
+          if metrics:
+              failed.append(metrics)
+          if failed:
+              raise SystemExit("Server containers crashed:\n" + "\n".join(failed))
+          PY
           novavision start app --id demo
           novavision stop app --id demo
           novavision stop server --close-apps

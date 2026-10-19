@@ -106,6 +106,276 @@ def is_agent_running():
     return _pid_is_metrics_agent(pid)
 
 
+PUBLISHER_CONTAINER = "novavision-host-metrics"
+PUBLISHER_IMAGE = "alpine:3.20"
+
+
+def metrics_www_dir():
+    path = state_dir() / "metrics-www"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_metrics_file(payload):
+    directory = metrics_www_dir()
+    target = directory / "metrics.json"
+    data = json.dumps(payload, separators=(",", ":"))
+    temporary = directory / "metrics.json.tmp"
+    temporary.write_text(data, encoding="utf-8")
+    try:
+        os.replace(str(temporary), str(target))
+    except OSError:
+        target.write_text(data, encoding="utf-8")
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return target
+
+
+PUBLISHER_COMMAND = [
+    "nc",
+    "-lk",
+    "-p",
+    "18765",
+    "-e",
+    "/bin/sh",
+    "/data/serve.sh",
+]
+
+
+def _publisher_script():
+    # Each connection is its own process. read -t stops a client that sends
+    # nothing from occupying that process. The body is copied once so the
+    # Content-Length matches the bytes that are sent.
+    return """#!/bin/sh
+i=0
+while [ "$i" -lt 40 ]; do
+  IFS= read -r -t 2 line || exit 0
+  line=$(printf '%s' "$line" | tr -d '\\r')
+  [ -z "$line" ] && break
+  i=$((i + 1))
+done
+body=/data/metrics.json
+if [ ! -s "$body" ]; then
+  body=/data/empty.json
+fi
+tmp=$(mktemp /tmp/metrics.XXXXXX) || exit 0
+cp "$body" "$tmp" || exit 0
+size=$(wc -c < "$tmp" | tr -d ' ')
+{
+  printf 'HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: %s\\r\\nCache-Control: no-store\\r\\nConnection: close\\r\\n\\r\\n' "$size"
+  cat "$tmp"
+}
+rm -f "$tmp"
+"""
+
+
+def _publisher_is_running():
+    if not shutil.which("docker"):
+        return False
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", PUBLISHER_CONTAINER],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
+
+
+def _remove_metrics_publisher():
+    if not shutil.which("docker"):
+        return
+    subprocess.run(
+        ["docker", "rm", "-f", PUBLISHER_CONTAINER],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _publisher_inspect():
+    if not shutil.which("docker"):
+        return None
+    result = subprocess.run(
+        ["docker", "inspect", PUBLISHER_CONTAINER],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    return payload if isinstance(payload, dict) else None
+
+
+def _host_publisher_responds(port, timeout=2):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(("127.0.0.1", int(port)))
+        sock.sendall(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        data = b""
+        while len(data) < 256 and b"\r\n" not in data:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    status = data.split(b"\r\n", 1)[0]
+    return status.startswith(b"HTTP/1.") and b" 200 " in status
+
+
+def _container_publisher_responds(port, timeout=5):
+    """Ask from a container, which is how the websocket reaches metrics.
+
+    Colima does not always open published ports on the Mac's own loopback.
+    """
+    if not shutil.which("docker"):
+        return False
+    url = "http://{0}:{1}/metrics".format(HOST_METRICS_HOSTNAME, int(port))
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--add-host",
+                "{0}:host-gateway".format(HOST_METRICS_HOSTNAME),
+                PUBLISHER_IMAGE,
+                "wget",
+                "-q",
+                "-T",
+                str(max(1, int(timeout))),
+                "-O",
+                "-",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(10, int(timeout) + 15),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and (result.stdout or "").lstrip().startswith("{")
+
+
+def _publisher_responds(port, timeout=2):
+    if _host_publisher_responds(port, timeout=timeout):
+        return True
+    return _container_publisher_responds(port, timeout=max(timeout, 3))
+
+
+def publisher_is_responding(port=DEFAULT_PORT):
+    return _publisher_responds(port)
+
+
+def _wait_for_publisher(port):
+    for _ in range(10):
+        if _host_publisher_responds(port, timeout=0.5):
+            return True
+        time.sleep(0.2)
+    return _container_publisher_responds(port, timeout=5)
+
+
+def _publisher_is_current(port):
+    info = _publisher_inspect()
+    if not info or not (info.get("State") or {}).get("Running"):
+        return False
+    host_config = info.get("HostConfig") or {}
+    policy = (host_config.get("RestartPolicy") or {}).get("Name")
+    if policy != "unless-stopped":
+        return False
+    if list((info.get("Config") or {}).get("Cmd") or []) != PUBLISHER_COMMAND:
+        return False
+    bindings = (host_config.get("PortBindings") or {}).get("18765/tcp") or []
+    host_ports = [
+        str(item.get("HostPort"))
+        for item in bindings
+        if isinstance(item, dict)
+    ]
+    if str(int(port)) not in host_ports:
+        return False
+    return _publisher_responds(port)
+
+
+def ensure_metrics_publisher(port, logger=None):
+    """Serve metrics through Docker's own port proxy.
+
+    The websocket container calls host.docker.internal:18765. A host process
+    listening there is a new inbound program, which Windows and macOS can block.
+    Docker's published port uses the Docker process the user already allowed.
+    """
+    if _publisher_is_current(port):
+        return True
+    if not shutil.which("docker"):
+        if logger:
+            logger.warning("Docker is not available to publish host metrics.")
+        return False
+
+    directory = metrics_www_dir()
+    script = directory / "serve.sh"
+    script.write_bytes(_publisher_script().replace("\r\n", "\n").encode("utf-8"))
+    (directory / "empty.json").write_text("{}\n", encoding="utf-8")
+    if not (directory / "metrics.json").exists():
+        (directory / "metrics.json").write_text("{}\n", encoding="utf-8")
+
+    _remove_metrics_publisher()
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            PUBLISHER_CONTAINER,
+            "--restart",
+            "unless-stopped",
+            "-p",
+            "{0}:18765".format(int(port)),
+            "-v",
+            "{0}:/data:ro".format(str(directory.resolve())),
+            PUBLISHER_IMAGE,
+            *PUBLISHER_COMMAND,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if logger:
+            logger.warning(
+                "Could not publish host metrics on port {0}.{1}".format(
+                    port, " {0}".format(detail) if detail else ""
+                )
+            )
+        return False
+    if not _wait_for_publisher(port):
+        _remove_metrics_publisher()
+        if logger:
+            logger.warning(
+                "Host metrics publisher did not respond on port {0}.".format(port)
+            )
+        return False
+    if logger:
+        logger.info("Host metrics are published through Docker on port {0}.".format(port))
+    return True
+
+
 def port_is_available(port, bind=DEFAULT_BIND):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -485,11 +755,10 @@ def make_handler(collector):
 def serve_host_metrics(port=DEFAULT_PORT, bind=DEFAULT_BIND, interval=DEFAULT_INTERVAL):
     collector = HostMetricsCollector()
     collector.start(interval=interval)
-    server = ThreadingHTTPServer((bind, int(port)), make_handler(collector))
-    server.daemon_threads = True
+    stop = threading.Event()
 
     def _shutdown(signum, frame):
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        stop.set()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -497,10 +766,11 @@ def serve_host_metrics(port=DEFAULT_PORT, bind=DEFAULT_BIND, interval=DEFAULT_IN
         signal.signal(signal.SIGBREAK, _shutdown)
 
     try:
-        server.serve_forever()
+        write_metrics_file(collector.snapshot())
+        while not stop.wait(float(interval)):
+            write_metrics_file(collector.snapshot())
     finally:
         collector.stop()
-        server.server_close()
     return 0
 
 
@@ -509,15 +779,21 @@ def start_host_metrics(
 ):
     if is_agent_running():
         state = load_state()
+        try:
+            running_port = int(state.get("port", DEFAULT_PORT))
+        except (TypeError, ValueError):
+            running_port = DEFAULT_PORT
+        if not ensure_metrics_publisher(running_port, logger):
+            return None
         if logger:
             logger.info(
-                "Host metrics already running on port {0}.".format(
-                    state.get("port", DEFAULT_PORT)
-                )
+                "Host metrics already running on port {0}.".format(running_port)
             )
         return state
 
     selected_port = choose_port(preferred=port or DEFAULT_PORT, bind=bind)
+    if selected_port is None and _publisher_is_running():
+        selected_port = int(port or DEFAULT_PORT)
     if selected_port is None:
         if logger:
             logger.warning(
@@ -526,6 +802,9 @@ def start_host_metrics(
                     port or DEFAULT_PORT, metrics_url(DEFAULT_PORT)
                 )
             )
+        return None
+
+    if not ensure_metrics_publisher(selected_port, logger):
         return None
 
     log_file = log_path()
@@ -560,6 +839,7 @@ def start_host_metrics(
     if process.poll() is not None:
         if logger:
             logger.warning("Host metrics agent exited immediately.")
+        _remove_metrics_publisher()
         clear_state()
         return None
 
@@ -577,6 +857,7 @@ def start_host_metrics(
 
 
 def stop_host_metrics(logger=None):
+    _remove_metrics_publisher()
     pid = _read_pid()
     if not pid:
         clear_state()
