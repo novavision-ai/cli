@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from novavision import __version__
-from novavision.config import DEFAULT_HOST, resolve_install_defaults
+from novavision.config import DEFAULT_HOST, logs_dir, resolve_install_defaults
 from novavision.credentials import (
     CredentialsError,
     active_login_label,
@@ -27,6 +27,7 @@ from novavision.host_metrics import (
     serve_host_metrics,
 )
 from novavision.service_manager import ServiceManager
+from novavision.cli_update import begin_update_check, finish_update_check, self_update
 from novavision.update_listener import serve_update_listener
 
 logger = ConsoleLogger()
@@ -198,6 +199,13 @@ def _prompt_secret_posix(prompt, mask):
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
+def _operation_logger(prefix, label):
+    log_file = logs_dir() / f"{prefix}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    operation_logger = logger.copy_settings(log_file_path=str(log_file))
+    operation_logger.info(f"Logging {label} to {log_file}")
+    return operation_logger
+
+
 EPILOG = """examples:
   novavision login
   novavision whoami
@@ -208,6 +216,7 @@ EPILOG = """examples:
   novavision logs server --id abcdef --follow
   novavision stop server --id abcdef --close-apps
   novavision update server --id abcdef --yes
+  novavision self-update
   novavision uninstall server --id abcdef --yes
   novavision logout
 """
@@ -260,6 +269,7 @@ class NovaVisionCLI:
         self._add_whoami_parser(subparsers, parent)
         self._add_install_parser(subparsers, parent)
         self._add_update_parser(subparsers, parent)
+        self._add_self_update_parser(subparsers, parent)
         self._add_uninstall_parser(subparsers, parent)
         self._add_start_parser(subparsers, parent)
         self._add_stop_parser(subparsers, parent)
@@ -367,6 +377,13 @@ class NovaVisionCLI:
             "--yes",
             action="store_true",
             help="Do not ask for update confirmation",
+        )
+
+    def _add_self_update_parser(self, subparsers, parent):
+        subparsers.add_parser(
+            "self-update",
+            help="Upgrade this CLI from PyPI",
+            parents=[parent],
         )
 
     def _add_uninstall_parser(self, subparsers, parent):
@@ -595,13 +612,7 @@ class NovaVisionCLI:
                     f"but the saved login is for {canonical_host(auth.host)}."
                 )
                 raise SystemExit(1)
-        log_dir = Path.home() / ".novavision"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = (
-            log_dir / f"install-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-        )
-        install_logger = logger.copy_settings(log_file_path=str(log_file))
-        install_logger.info(f"Logging installation to {log_file}")
+        install_logger = _operation_logger("install", "installation")
         self.installer = Installer(logger=install_logger)
         if args.non_interactive and not workspace:
             logger.error("--non-interactive requires --workspace.")
@@ -621,13 +632,7 @@ class NovaVisionCLI:
     def handle_update(self, args):
         auth = self._require_auth(args)
         self._show_active_login(auth)
-        log_dir = Path.home() / ".novavision"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = (
-            log_dir / f"update-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-        )
-        update_logger = logger.copy_settings(log_file_path=str(log_file))
-        update_logger.info(f"Logging update to {log_file}")
+        update_logger = _operation_logger("update", "update")
         self.installer = Installer(logger=update_logger)
         success = self.installer.update(
             token=auth.token,
@@ -641,13 +646,7 @@ class NovaVisionCLI:
     def handle_uninstall(self, args):
         auth = self._require_auth(args)
         self._show_active_login(auth)
-        log_dir = Path.home() / ".novavision"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = (
-            log_dir / f"uninstall-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-        )
-        uninstall_logger = logger.copy_settings(log_file_path=str(log_file))
-        uninstall_logger.info(f"Logging uninstall to {log_file}")
+        uninstall_logger = _operation_logger("uninstall", "uninstall")
         self.installer = Installer(logger=uninstall_logger)
         success = self.installer.uninstall(
             token=auth.token,
@@ -731,6 +730,10 @@ class NovaVisionCLI:
         ):
             raise SystemExit(1)
 
+    def handle_self_update(self, args):
+        if not self_update(logger):
+            raise SystemExit(1)
+
     def handle_internal_service_command(self, args):
         success = self.service.run_service_action(
             action=args.action, server_name=args.server
@@ -772,6 +775,14 @@ class NovaVisionCLI:
         parser = self.create_parser()
         args = parser.parse_args()
         self._apply_logger_settings(args)
+        check = None
+        if args.command != "self-update":
+            try:
+                check = begin_update_check(
+                    json_mode=bool(getattr(args, "json_mode", False))
+                )
+            except Exception:
+                check = None
 
         try:
             if args.command == "login":
@@ -784,6 +795,8 @@ class NovaVisionCLI:
                 self.handle_install(args)
             elif args.command == "update":
                 self.handle_update(args)
+            elif args.command == "self-update":
+                self.handle_self_update(args)
             elif args.command == "uninstall":
                 self.handle_uninstall(args)
             elif args.command in ["start", "stop"]:
@@ -803,6 +816,11 @@ class NovaVisionCLI:
         except Exception as e:
             logger.error(f"An error occurred: {str(e)}")
             raise SystemExit(1)
+        finally:
+            try:
+                finish_update_check(check)
+            except Exception:
+                pass
 
 
 def main():

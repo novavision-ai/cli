@@ -17,6 +17,7 @@ setup(
         "rich==13.9.4",
         "pyyaml==6.0.2",
         "redis==5.2.1",
+        "packaging>=24.2,<26",
     ],
     extras_require={
         ":sys_platform=='darwin'": ["pyobjc"],

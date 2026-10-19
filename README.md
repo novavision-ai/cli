@@ -44,6 +44,15 @@ novavision install [edge|local|cloud] <USER_TOKEN> --host <HOST> --workspace <US
 
 ---
 
+### **self-update**
+Upgrades this CLI from PyPI. A pip install upgrades with pip. A pipx install upgrades with `pipx upgrade`.
+
+```bash
+novavision self-update
+```
+
+---
+
 ### **update**
 Downloads the latest server package for an existing server and rebuilds it.
 
