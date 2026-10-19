@@ -8,11 +8,13 @@ from novavision.host_metrics import (
     DEFAULT_PORT,
     HostMetricsCollector,
     _nvidia_smi_gpus,
+    ensure_metrics_publisher,
     is_agent_running,
     make_handler,
     metrics_url,
     start_host_metrics,
     stop_host_metrics,
+    write_metrics_file,
 )
 
 
@@ -127,15 +129,16 @@ def test_macos_ioreg_parser():
 
 
 def test_start_host_metrics_is_idempotent(fake_logger, nv_home):
-    with patch("novavision.host_metrics.is_agent_running", return_value=False):
-        with patch("novavision.host_metrics.port_is_available", return_value=True):
-            with patch("novavision.host_metrics.subprocess.Popen") as popen:
-                popen.return_value = Mock(pid=4321, poll=Mock(return_value=None))
-                first = start_host_metrics(fake_logger)
-                with patch(
-                    "novavision.host_metrics.is_agent_running", return_value=True
-                ):
-                    second = start_host_metrics(fake_logger)
+    with patch("novavision.host_metrics.ensure_metrics_publisher", return_value=True):
+        with patch("novavision.host_metrics.is_agent_running", return_value=False):
+            with patch("novavision.host_metrics.port_is_available", return_value=True):
+                with patch("novavision.host_metrics.subprocess.Popen") as popen:
+                    popen.return_value = Mock(pid=4321, poll=Mock(return_value=None))
+                    first = start_host_metrics(fake_logger)
+                    with patch(
+                        "novavision.host_metrics.is_agent_running", return_value=True
+                    ):
+                        second = start_host_metrics(fake_logger)
     assert first["pid"] == 4321
     assert first["url"] == metrics_url(DEFAULT_PORT)
     assert first["port"] == DEFAULT_PORT
@@ -147,8 +150,123 @@ def test_start_host_metrics_is_idempotent(fake_logger, nv_home):
 def test_start_host_metrics_stays_on_fixed_port(fake_logger, nv_home):
     with patch("novavision.host_metrics.is_agent_running", return_value=False):
         with patch("novavision.host_metrics.port_is_available", return_value=False):
-            assert start_host_metrics(fake_logger) is None
+            with patch("novavision.host_metrics._publisher_is_running", return_value=False):
+                assert start_host_metrics(fake_logger) is None
     assert any("18765" in message for message in fake_logger.messages_of("warning"))
+
+
+def test_metrics_publisher_uses_docker_not_the_firewall(fake_logger, nv_home):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["docker", "inspect"]:
+            return Mock(returncode=1, stdout="", stderr="")
+        return Mock(returncode=0, stdout="container\n", stderr="")
+
+    with patch("novavision.host_metrics.shutil.which", return_value="docker"):
+        with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
+            with patch("novavision.host_metrics._publisher_responds", return_value=True):
+                assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is True
+
+    assert not any(args[0] in ("netsh", "sudo") for args in calls)
+    run = next(args for args in calls if args[:2] == ["docker", "run"])
+    assert "--restart" in run and "unless-stopped" in run
+    assert "-lk" in run
+    assert "-p" in run
+    assert "{0}:18765".format(DEFAULT_PORT) in run
+    assert "alpine:3.20" in run
+    script = (nv_home / ".novavision" / "metrics-www" / "serve.sh").read_bytes()
+    assert b"\r" not in script
+    assert b"mktemp" in script
+    assert any(
+        "published through Docker" in message for message in fake_logger.messages_of("info")
+    )
+
+
+def test_metrics_publisher_replaces_a_stuck_container(fake_logger, nv_home):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["docker", "inspect"]:
+            payload = [
+                {
+                    "State": {"Running": True},
+                    "Config": {"Cmd": ["nc", "-l", "-p", "18765"]},
+                    "HostConfig": {
+                        "RestartPolicy": {"Name": "no"},
+                        "PortBindings": {"18765/tcp": [{"HostPort": str(DEFAULT_PORT)}]},
+                    },
+                }
+            ]
+            return Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        return Mock(returncode=0, stdout="container\n", stderr="")
+
+    with patch("novavision.host_metrics.shutil.which", return_value="docker"):
+        with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
+            with patch("novavision.host_metrics._publisher_responds", return_value=True):
+                assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is True
+
+    assert ["docker", "rm", "-f", "novavision-host-metrics"] in calls
+    assert any(args[:2] == ["docker", "run"] for args in calls)
+
+
+def test_metrics_publisher_keeps_a_healthy_container(fake_logger, nv_home):
+    from novavision.host_metrics import PUBLISHER_COMMAND
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        payload = [
+            {
+                "State": {"Running": True},
+                "Config": {"Cmd": list(PUBLISHER_COMMAND)},
+                "HostConfig": {
+                    "RestartPolicy": {"Name": "unless-stopped"},
+                    "PortBindings": {"18765/tcp": [{"HostPort": str(DEFAULT_PORT)}]},
+                },
+            }
+        ]
+        return Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    with patch("novavision.host_metrics.shutil.which", return_value="docker"):
+        with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
+            with patch("novavision.host_metrics._publisher_responds", return_value=True):
+                assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is True
+
+    assert not any(args[:2] == ["docker", "run"] for args in calls)
+
+
+def test_metrics_publisher_fails_when_it_does_not_respond(fake_logger, nv_home):
+    def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "inspect"]:
+            return Mock(returncode=1, stdout="", stderr="")
+        return Mock(returncode=0, stdout="container\n", stderr="")
+
+    with patch("novavision.host_metrics.shutil.which", return_value="docker"):
+        with patch("novavision.host_metrics.subprocess.run", side_effect=fake_run):
+            with patch("novavision.host_metrics._wait_for_publisher", return_value=False):
+                assert ensure_metrics_publisher(DEFAULT_PORT, fake_logger) is False
+
+    assert any(
+        "did not respond" in message for message in fake_logger.messages_of("warning")
+    )
+
+
+def test_start_host_metrics_stops_when_publisher_fails(fake_logger, nv_home):
+    with patch("novavision.host_metrics.ensure_metrics_publisher", return_value=False):
+        with patch("novavision.host_metrics.is_agent_running", return_value=False):
+            with patch("novavision.host_metrics.port_is_available", return_value=True):
+                with patch("novavision.host_metrics.subprocess.Popen") as popen:
+                    assert start_host_metrics(fake_logger) is None
+    popen.assert_not_called()
+
+
+def test_write_metrics_file_replaces_snapshot(nv_home):
+    path = write_metrics_file({"source": "host", "ok": True})
+    assert json.loads(path.read_text(encoding="utf-8"))["source"] == "host"
 
 
 def test_stop_host_metrics_kills_agent(fake_logger, nv_home):

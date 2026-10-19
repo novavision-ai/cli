@@ -1,3 +1,4 @@
+import time
 import shutil
 import subprocess
 from pathlib import Path
@@ -62,6 +63,12 @@ def test_compose_start_app_and_stop(fake_logger, nv_home):
     try:
         assert manager.start_server_folder(server_folder) is True
         assert manager._server_is_running(server_folder) is True
+        time.sleep(15)
+        crashed = manager.crashed_containers(server_folder / "docker-compose.yml")
+        metrics = manager.metrics_publisher_problem()
+        if metrics:
+            crashed.append(metrics)
+        assert crashed == [], crashed
         assert manager._start_app("demo") is True
         assert manager._stop_app("demo") is True
     finally:
