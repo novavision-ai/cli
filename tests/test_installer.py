@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import zipfile
 from unittest.mock import Mock, patch
 
@@ -657,3 +658,133 @@ def test_update_rejects_server_on_a_different_host_than_the_saved_login(
         "registered on https://suite.novavision.ai" in message
         for message in fake_logger.messages_of("error")
     )
+
+
+def _device_info():
+    return {
+        "device_name": "ci-runner",
+        "serial": "ABC123",
+        "processor": "cpu",
+        "cpu": "CI CPU",
+        "gpu": "GPU not found",
+        "os": "Linux",
+        "disk": "1G/1G",
+        "memory": "2.00 GB",
+        "architecture": "x86_64",
+        "platform": "PC",
+    }
+
+
+def _install(installer, **kwargs):
+    options = {
+        "device_type": "local",
+        "token": "ci-token",
+        "host": "https://suite.novavision.ai",
+        "workspace": "ci",
+    }
+    options.update(kwargs)
+    previous = os.getcwd()
+    try:
+        return installer.install(**options)
+    finally:
+        os.chdir(previous)
+
+
+def test_install_asks_before_stopping_running_agents(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    fake_logger.answers = [False]
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(
+            installer.docker, "running_server_names", return_value=["abcdef"]
+        ):
+            with patch.object(
+                installer.docker, "_cleanup_previous_docker_installations"
+            ) as cleanup:
+                assert _install(installer) is False
+    cleanup.assert_not_called()
+    warnings = fake_logger.messages_of("warning")
+    assert any(
+        "stops every running agent (abcdef)" in message for message in warnings
+    )
+    assert not any("start" in message.lower() for message in warnings)
+    assert any(
+        "Install cancelled." in message for message in fake_logger.messages_of("error")
+    )
+
+
+def test_install_warns_without_asking_when_non_interactive(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    fake_logger.answers = [False]
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(
+            installer.docker, "running_server_names", return_value=["abcdef", "ghijkl"]
+        ):
+            with patch.object(
+                installer.docker, "_cleanup_previous_docker_installations"
+            ) as cleanup:
+                with patch(
+                    "novavision.installer.get_system_info",
+                    return_value={"error": "skip"},
+                ):
+                    assert _install(installer, non_interactive=True) is False
+    cleanup.assert_called_once()
+    assert fake_logger.messages_of("question") == []
+    warnings = fake_logger.messages_of("warning")
+    assert any(
+        "stops every running agent (abcdef, ghijkl)" in message for message in warnings
+    )
+    assert not any("start" in message.lower() for message in warnings)
+
+
+def test_install_skips_the_agent_warning_when_nothing_is_running(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(installer.docker, "running_server_names", return_value=[]):
+            with patch.object(
+                installer.docker, "_cleanup_previous_docker_installations"
+            ) as cleanup:
+                with patch(
+                    "novavision.installer.get_system_info",
+                    return_value={"error": "skip"},
+                ):
+                    assert _install(installer) is False
+    cleanup.assert_called_once()
+    assert fake_logger.messages_of("question") == []
+    assert not any(
+        "running agent" in message for message in fake_logger.messages_of("warning")
+    )
+
+
+def test_install_continues_after_the_running_agent_warning(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    fake_logger.answers = [True]
+    server_folder = nv_home / ".novavision" / "Server" / "newsrv"
+    with patch.object(installer.docker, "_check_docker_available", return_value=True):
+        with patch.object(
+            installer.docker, "running_server_names", return_value=["abcdef"]
+        ):
+            with patch.object(installer.docker, "_cleanup_previous_docker_installations"):
+                with patch(
+                    "novavision.installer.get_system_info", return_value=_device_info()
+                ):
+                    with patch.object(
+                        installer, "_get_workspace_id", return_value=(15, "ci")
+                    ):
+                        with patch.object(installer, "_set_workspace", return_value=True):
+                            with patch.object(
+                                installer,
+                                "_register_device",
+                                return_value={"id_device": "99", "name": "ci-runner"},
+                            ):
+                                with patch.object(
+                                    installer, "_setup_server", return_value=server_folder
+                                ):
+                                    with patch(
+                                        "novavision.update_listener.start_update_listener"
+                                    ):
+                                        assert _install(installer, port="7001") is True
+    warnings = fake_logger.messages_of("warning")
+    assert any(
+        "stops every running agent (abcdef)" in message for message in warnings
+    )
+    assert not any("start" in message.lower() for message in warnings)

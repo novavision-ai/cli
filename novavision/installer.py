@@ -254,6 +254,10 @@ class Installer:
         self.log.step(1, total_steps, "Checking Docker")
         if not self.docker._check_docker_available():
             return False
+
+        if not self._confirm_stop_running_agents(self.docker.running_server_names()):
+            return False
+
         self.log.step(2, total_steps, "Cleaning previous installations")
         self.docker._cleanup_previous_docker_installations()
 
@@ -318,6 +322,21 @@ class Installer:
 
         start_update_listener(self.log)
         return True
+
+    def _confirm_stop_running_agents(self, names):
+        if not names:
+            return True
+
+        listed = ", ".join(names)
+        self.log.warning(
+            f"Installing a new server stops every running agent ({listed})."
+        )
+        if self.non_interactive:
+            return True
+        if self.log.confirm("Continue with the install?", default=False):
+            return True
+        self.log.error("Install cancelled.")
+        return False
 
     def _get_workspace_id(self, host, token, workspace):
         # Host ve endpoint ayarlama

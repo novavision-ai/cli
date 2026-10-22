@@ -1591,6 +1591,14 @@ class DockerManager:
             return False
         return self._compose_is_running(Path(server_folder) / "docker-compose.yml")
 
+    def running_server_names(self):
+        server_path = Path.home() / ".novavision" / "Server"
+        return [
+            folder.name
+            for folder in self._visible_server_folders(server_path)
+            if self._server_is_running(folder)
+        ]
+
     def _other_running_server(self, server_folder):
         server_path = Path.home() / ".novavision" / "Server"
         target = Path(server_folder).resolve()

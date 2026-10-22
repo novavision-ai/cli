@@ -189,6 +189,20 @@ def test_start_server_folder_starts_host_metrics(fake_logger, nv_home):
     start.assert_called_once()
 
 
+def test_running_server_names_lists_only_running_servers(fake_logger, nv_home):
+    server_path = nv_home / ".novavision" / "Server"
+    (server_path / "aaaaaa").mkdir(parents=True)
+    (server_path / "bbbbbb").mkdir(parents=True)
+    (server_path / ".hidden").mkdir()
+    manager = DockerManager(logger=fake_logger)
+
+    def running(folder):
+        return folder.name == "bbbbbb"
+
+    with patch.object(manager, "_server_is_running", side_effect=running):
+        assert manager.running_server_names() == ["bbbbbb"]
+
+
 def test_start_server_folder_rejects_a_second_running_server(fake_logger, nv_home):
     server_path = nv_home / ".novavision" / "Server"
     first = server_path / "aaaaaa"
