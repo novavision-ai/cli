@@ -5,7 +5,11 @@ from unittest.mock import Mock, patch
 import yaml
 
 from novavision.credentials import save_credentials
-from novavision.docker_manager import DockerManager
+from novavision.docker_manager import (
+    HOST_ALIAS_ENTRY,
+    DockerManager,
+    _HOST_ALIAS_PROBE,
+)
 
 
 def test_metadata_path_uses_home_novavision(fake_logger, nv_home):
@@ -183,6 +187,20 @@ def test_start_server_folder_starts_host_metrics(fake_logger, nv_home):
         ) as start:
             assert manager.start_server_folder(server_folder) is True
     start.assert_called_once()
+
+
+def test_running_server_names_lists_only_running_servers(fake_logger, nv_home):
+    server_path = nv_home / ".novavision" / "Server"
+    (server_path / "aaaaaa").mkdir(parents=True)
+    (server_path / "bbbbbb").mkdir(parents=True)
+    (server_path / ".hidden").mkdir()
+    manager = DockerManager(logger=fake_logger)
+
+    def running(folder):
+        return folder.name == "bbbbbb"
+
+    with patch.object(manager, "_server_is_running", side_effect=running):
+        assert manager.running_server_names() == ["bbbbbb"]
 
 
 def test_start_server_folder_rejects_a_second_running_server(fake_logger, nv_home):
@@ -1083,22 +1101,127 @@ def test_stale_container_is_removed_and_recreated(fake_logger, tmp_path):
     )
 
 
-def test_host_gateway_override_on_linux_and_mac(fake_logger, tmp_path):
+def test_host_gateway_override_skips_services_that_already_reach_the_host(
+    fake_logger, tmp_path
+):
     compose_file = tmp_path / "docker-compose.yml"
     compose_file.write_text(
-        "services:\n  wsl:\n    image: alpine\n",
+        "services:\n"
+        "  wsl:\n"
+        "    image: alpine\n"
+        "  explicit:\n"
+        "    image: alpine\n"
+        "    extra_hosts:\n"
+        "      - other.example:1.2.3.4\n"
+        "      - host.docker.internal:10.0.0.1\n"
+        "  mapped:\n"
+        "    image: alpine\n"
+        "    extra_hosts:\n"
+        "      host.docker.internal: host-gateway\n"
+        "  sidecar:\n"
+        "    image: alpine\n"
+        "    network_mode: service:wsl\n",
         encoding="utf-8",
     )
     manager = DockerManager(logger=fake_logger)
-    with patch("novavision.docker_manager.sys.platform", "win32"):
-        assert manager._host_gateway_override(compose_file) is None
-
-    with patch("novavision.docker_manager.sys.platform", "linux"):
-        override = manager._host_gateway_override(compose_file)
+    override = manager._host_gateway_override(compose_file)
     data = yaml.safe_load(override.read_text(encoding="utf-8"))
-    assert data["services"]["wsl"]["extra_hosts"] == [
-        "host.docker.internal:host-gateway"
-    ]
+    assert list(data["services"]) == ["wsl"]
+    assert data["services"]["wsl"]["extra_hosts"] == [HOST_ALIAS_ENTRY]
+
+
+def test_host_alias_probe_reports_only_a_missing_name(fake_logger):
+    manager = DockerManager(logger=fake_logger)
+    compile(_HOST_ALIAS_PROBE, "<host-alias-probe>", "exec")
+
+    def fake_run(args, **kwargs):
+        if args[3] == "python":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+        raise AssertionError(args)
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=fake_run):
+        assert manager._container_resolves_host_alias("wsl") is False
+
+
+def test_host_alias_probe_ignores_timeouts_and_missing_tools(fake_logger):
+    manager = DockerManager(logger=fake_logger)
+
+    def timed_out(args, **kwargs):
+        if args[3] == "python":
+            return subprocess.CompletedProcess(args, 2, stdout="", stderr="")
+        raise AssertionError(args)
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=timed_out):
+        assert manager._container_resolves_host_alias("wsl") is None
+
+    def no_tools(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            127,
+            stdout="",
+            stderr='exec: "{0}": executable file not found'.format(args[3]),
+        )
+
+    with patch("novavision.docker_manager.subprocess.run", side_effect=no_tools):
+        assert manager._container_resolves_host_alias("wsl") is None
+
+
+def test_running_container_without_host_alias_is_recreated(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n"
+        "  wsl:\n"
+        "    container_name: wsl-service\n"
+        "  media:\n"
+        "    container_name: media-service\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+
+    def resolves(name):
+        return name != "wsl-service"
+
+    with patch.object(manager, "_container_running_state", return_value=True):
+        with patch.object(manager, "_container_extra_hosts", return_value=[]):
+            with patch.object(
+                manager, "_container_resolves_host_alias", side_effect=resolves
+            ):
+                with patch(
+                    "novavision.docker_manager.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["docker", "ps"], 0, stdout="", stderr=""
+                    ),
+                ):
+                    with patch.object(manager, "run_docker_compose") as compose_up:
+                        assert manager._start_server(compose_file) is True
+    compose_up.assert_called_once()
+    assert compose_up.call_args.args[1:] == ("up", "-d", "wsl")
+
+
+def test_running_container_keeps_a_working_host_alias(fake_logger, tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "services:\n  wsl:\n    container_name: wsl-service\n",
+        encoding="utf-8",
+    )
+    manager = DockerManager(logger=fake_logger)
+    with patch.object(manager, "_container_running_state", return_value=True):
+        with patch.object(
+            manager,
+            "_container_extra_hosts",
+            return_value=["host.docker.internal:192.168.65.254"],
+        ):
+            with patch.object(manager, "_container_resolves_host_alias") as probe:
+                with patch(
+                    "novavision.docker_manager.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["docker", "ps"], 0, stdout="", stderr=""
+                    ),
+                ):
+                    with patch.object(manager, "run_docker_compose") as compose_up:
+                        assert manager._start_server(compose_file) is True
+    probe.assert_not_called()
+    compose_up.assert_not_called()
 
 
 def test_crashed_containers_flags_bad_exit(fake_logger, tmp_path):

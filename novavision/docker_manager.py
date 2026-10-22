@@ -27,6 +27,49 @@ _ANSI_ESCAPE = re.compile(
 )
 
 
+HOST_ALIAS = "host.docker.internal"
+HOST_ALIAS_ENTRY = "host.docker.internal:host-gateway"
+_HOST_ALIAS_PROBE = (
+    "import socket\n"
+    "socket.setdefaulttimeout(2)\n"
+    "try:\n"
+    "    socket.getaddrinfo({hostname!r}, 80)\n"
+    "except socket.gaierror as exc:\n"
+    "    raise SystemExit(1 if exc.errno == socket.EAI_NONAME else 2)\n"
+    "except OSError:\n"
+    "    raise SystemExit(2)\n"
+).format(hostname=HOST_ALIAS)
+
+
+def _defines_host_alias(extra_hosts):
+    if isinstance(extra_hosts, dict):
+        return HOST_ALIAS in extra_hosts
+    if not isinstance(extra_hosts, list):
+        return False
+    for item in extra_hosts:
+        if not isinstance(item, str):
+            continue
+        if item.split(":", 1)[0].strip() == HOST_ALIAS:
+            return True
+    return False
+
+
+def _service_needs_host_alias(config):
+    if not isinstance(config, dict):
+        return False
+    mode = str(config.get("network_mode") or "")
+    if mode.startswith("container:") or mode.startswith("service:"):
+        return False
+    return not _defines_host_alias(config.get("extra_hosts"))
+
+
+def _exec_tool_missing(result):
+    if result.returncode == 127:
+        return True
+    text = "{0}\n{1}".format(result.stderr or "", result.stdout or "").lower()
+    return "executable file not found" in text
+
+
 class DockerManager:
     STATUS_MARK = "●"
     ASCII_STATUS_MARK = "*"
@@ -878,21 +921,17 @@ class DockerManager:
         )
         return override_path
 
-    def _needs_host_gateway(self):
-        # Docker Desktop on Windows already defines this name. Linux Docker
-        # Engine and Colima do not.
-        return sys.platform in ("linux", "darwin")
-
     def _host_gateway_override(self, compose_file):
-        if not self._needs_host_gateway():
-            return None
-
+        # Docker Desktop usually resolves this name, but a Windows engine,
+        # a custom container DNS, or an older daemon will not. host-gateway
+        # is the same alias already used on Linux and macOS, and it wins
+        # over DNS via the container hosts file.
         compose_file = Path(compose_file)
         services = self._load_compose_yaml(compose_file).get("services") or {}
         override_services = {
-            key: {"extra_hosts": ["host.docker.internal:host-gateway"]}
+            key: {"extra_hosts": [HOST_ALIAS_ENTRY]}
             for key, config in services.items()
-            if isinstance(config, dict)
+            if _service_needs_host_alias(config)
         }
         override_path = compose_file.parent / ".novavision-compose.hosts.yml"
         if not override_services:
@@ -1153,6 +1192,15 @@ class DockerManager:
                 missing.append(service)
                 continue
             if running:
+                if self._running_container_missing_host_alias(
+                    compose_file, service, name
+                ):
+                    self.log.warning(
+                        f"Container {name} cannot resolve {HOST_ALIAS}. "
+                        "Recreating it with the host alias."
+                    )
+                    missing.append(service)
+                    continue
                 self.log.info(f"Container {name} is already running.")
                 continue
             self._ensure_container_networks(
@@ -1182,6 +1230,73 @@ class DockerManager:
             )
             missing.append(service)
         return missing
+
+    def _container_extra_hosts(self, name):
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{json .HostConfig.ExtraHosts}}", name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            return None
+        raw = (result.stdout or "").strip()
+        if not raw or raw == "null":
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed]
+
+    def _container_resolves_host_alias(self, name):
+        """True when the name resolves, False when it does not, None if unknown."""
+        commands = (
+            ["python", "-c", _HOST_ALIAS_PROBE],
+            ["python3", "-c", _HOST_ALIAS_PROBE],
+            ["getent", "hosts", HOST_ALIAS],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", name, *command],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if _exec_tool_missing(result):
+                continue
+            detail = "{0}\n{1}".format(result.stderr or "", result.stdout or "")
+            if "Error response from daemon" in detail:
+                return None
+            if command[0] == "getent":
+                if result.returncode == 0:
+                    return True
+                if result.returncode == 2:
+                    return False
+                return None
+            if result.returncode == 0:
+                return True
+            if result.returncode == 1 and not (result.stderr or "").strip():
+                return False
+            return None
+        return None
+
+    def _running_container_missing_host_alias(self, compose_file, service, name):
+        services = self._load_compose_yaml(compose_file).get("services") or {}
+        if not _service_needs_host_alias(services.get(service)):
+            return False
+        extra_hosts = self._container_extra_hosts(name)
+        if extra_hosts is None or _defines_host_alias(extra_hosts):
+            return False
+        return self._container_resolves_host_alias(name) is False
 
     def crashed_containers(self, compose_file):
         """Services that are not running after launch.
@@ -1475,6 +1590,14 @@ class DockerManager:
         if not server_folder:
             return False
         return self._compose_is_running(Path(server_folder) / "docker-compose.yml")
+
+    def running_server_names(self):
+        server_path = Path.home() / ".novavision" / "Server"
+        return [
+            folder.name
+            for folder in self._visible_server_folders(server_path)
+            if self._server_is_running(folder)
+        ]
 
     def _other_running_server(self, server_folder):
         server_path = Path.home() / ".novavision" / "Server"
