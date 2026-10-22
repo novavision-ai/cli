@@ -28,9 +28,10 @@ def get_gpu_info():
     elif system == "Windows":
         try:
             command = "powershell -command \"Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name\""
-            result = subprocess.check_output(command, shell=True).decode('utf-8', errors='ignore').strip()
+            result = subprocess.check_output(command, shell=True).decode('utf-8', errors='ignore')
             processor = "gpu"
-            return result.split('\n'), processor
+            names = [line.strip() for line in result.splitlines() if line.strip()]
+            return names or ["GPU not found"], processor
         except:
             pass
 

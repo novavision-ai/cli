@@ -213,11 +213,32 @@ class Installer:
             data = response.json()
         except Exception:
             return None
+        return self._format_api_message(data)
+
+    def _format_api_message(self, data):
+        if isinstance(data, list):
+            parts = []
+            for item in data:
+                if not isinstance(item, dict):
+                    if item:
+                        parts.append(str(item))
+                    continue
+                field = str(item.get("field") or "").strip()
+                message = item.get("message") or item.get("error")
+                if isinstance(message, (dict, list)):
+                    message = str(message)
+                elif message is not None:
+                    message = str(message).strip()
+                if field and message:
+                    parts.append(f"{field}: {message}")
+                elif message:
+                    parts.append(message)
+            return "; ".join(parts) or None
         if not isinstance(data, dict):
             return None
         message = data.get("message") or data.get("error") or data.get("detail")
         if isinstance(message, (dict, list)):
-            message = str(message)
+            message = self._format_api_message(message) or str(message)
         elif message is not None:
             message = str(message).strip()
         return message or None
@@ -1092,9 +1113,12 @@ class Installer:
         current machine details, then asks Suite to rebuild the package.
         """
         port = (device or {}).get("os_api_port") or "7001"
+        # Suite may store a suffixed serial when the machine hash is already
+        # used. Sending the raw hash again fails the unique check.
+        serial = (device or {}).get("serial") or device_info["serial"]
         payload = {
             "name": (device or {}).get("name") or device_info["device_name"],
-            "serial": device_info["serial"],
+            "serial": serial,
             "processor": device_info["processor"],
             "cpu": device_info["cpu"],
             "gpu": device_info["gpu"],
@@ -1319,17 +1343,37 @@ class Installer:
         else:
             self.log.info(f"Keeping existing {destination.name}")
 
+    def _status_response_ready(self, response):
+        if getattr(response, "status_code", None) != 200:
+            return False
+        try:
+            data = response.json()
+        except Exception:
+            return True
+        if not isinstance(data, dict) or "status" not in data:
+            return True
+        return data.get("status") == "open"
+
     def _wait_for_server_status(self, server_folder):
         url = self._server_status_url(server_folder)
         deadline = time.time() + self.STATUS_TIMEOUT_SECONDS
         last_error = "no response"
         while time.time() < deadline:
             try:
-                response = requests.get(url, timeout=5)
-                if getattr(response, "status_code", None) == 200:
+                response = requests.post(url, timeout=5)
+                if getattr(response, "status_code", None) == 405:
+                    response = requests.get(url, timeout=5)
+                if self._status_response_ready(response):
                     self._last_status_error = ""
                     return True
-                last_error = f"HTTP {response.status_code}"
+                status = getattr(response, "status_code", None)
+                last_error = f"HTTP {status}" if status is not None else "no response"
+                try:
+                    body = response.json()
+                except Exception:
+                    body = None
+                if isinstance(body, dict) and body.get("status"):
+                    last_error = f"{last_error} ({body.get('status')})"
             except requests.exceptions.RequestException as e:
                 last_error = str(e)
             remaining = deadline - time.time()

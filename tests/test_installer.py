@@ -91,6 +91,38 @@ def test_response_error_text_prefers_json_message(fake_logger, nv_home):
     assert "400" in installer._response_error_text(response)
 
 
+def test_wait_for_server_status_posts_until_open(fake_logger, nv_home):
+    server_folder = nv_home / ".novavision" / "Server" / "abcdef"
+    server_folder.mkdir(parents=True)
+    (server_folder / ".env").write_text(
+        "DIGINOVA_WSL_SERVICE_PORT=7001\nSERVER_SSL=0\n", encoding="utf-8"
+    )
+    installer = Installer(logger=fake_logger)
+    loading = Mock(status_code=200)
+    loading.json.return_value = {"status": "loading"}
+    ready = Mock(status_code=200)
+    ready.json.return_value = {"status": "open", "message": "Bootstrap successfully loaded."}
+    with patch("novavision.installer.requests.post", side_effect=[loading, ready]) as post:
+        with patch("novavision.installer.requests.get") as get:
+            with patch("novavision.installer.time.sleep"):
+                assert installer._wait_for_server_status(server_folder) is True
+    assert post.call_count == 2
+    assert post.call_args.args[0] == "http://127.0.0.1:7001/status"
+    get.assert_not_called()
+
+
+def test_response_error_text_reads_field_errors(fake_logger, nv_home):
+    installer = Installer(logger=fake_logger)
+    response = Mock()
+    response.status_code = 422
+    response.json.return_value = [
+        {"field": "serial", "message": "This serial has already been taken."}
+    ]
+    assert installer._response_error_text(response) == (
+        "serial: This serial has already been taken. (HTTP 422)"
+    )
+
+
 def test_response_error_text_reports_status_without_html(fake_logger, nv_home):
     installer = Installer(logger=fake_logger)
     response = Mock()
@@ -363,6 +395,7 @@ def test_download_rebuilds_package_before_fetching_it(fake_logger, nv_home):
     device = {
         "id_device": 42,
         "name": "desk",
+        "serial": "D0739F54-2FZ",
         "device_type": 3,
         "os_api_port": "7001",
         "server_package": "old-package",
@@ -401,7 +434,7 @@ def test_download_rebuilds_package_before_fetching_it(fake_logger, nv_home):
     assert put_call[2]["name"] == "desk"
     assert put_call[2]["device_type"] == Installer.DEVICE_TYPE_LOCAL
     assert put_call[2]["os_api_port"] == "7001"
-    assert put_call[2]["serial"] == "ABC"
+    assert put_call[2]["serial"] == "D0739F54-2FZ"
     rebuild_call = calls[2]
     assert "rebuild-server?id=42" in rebuild_call[1]
     assert "expand=user" in rebuild_call[1]
